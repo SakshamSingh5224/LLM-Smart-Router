@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# large / generated artifacts
+data/*
+!data/.gitkeep
+results/*
+!results/.gitkeep
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store
