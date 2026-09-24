@@ -1,106 +1,119 @@
-# LLM Smart Routing & Cost Optimization - Phase 1
+# LLM Smart Routing & Cost Optimization System
 
-Environment, free model access, and the routing dataset for a gateway that sends
-simple prompts to a cheap model and hard prompts to a strong one (inspired by
-[RouteLLM](https://github.com/lm-sys/RouteLLM)).
+A cost-optimization gateway that intelligently intercepts user queries, evaluates their complexity using a locally trained classifier, and routes them to either a low-cost or high-cost large language model (LLM) tier. This project is inspired by [RouteLLM](https://github.com/lm-sys/RouteLLM).
 
-**Everything here is free.** No credit card, no paid API.
+**Current Status:** Phase 1 (Dataset & Baseline) and Phase 2 (Trained Classifier & FastAPI Router Service) are complete.
+
+## 🚀 Features
+
+* **Intelligent Routing:** Uses a custom Logistic Regression classifier trained on TF-IDF features and handcrafted domain signals (e.g., code presence, LaTeX math, reasoning keywords) to predict if a query requires a premium LLM.
+* **Cost vs. Quality Control:** Operators can choose routing presets (`aggressive`, `balanced`, `conservative`) or pass explicit thresholds to dynamically balance API costs against response quality.
+* **FastAPI Service:** Exposes a high-performance `POST /route` endpoint with single-digit millisecond latency overhead.
+* **Safe Fallbacks:** If the classifier artifact is missing or fails to parse a query, the system gracefully degrades to a deterministic, rule-based heuristic router without dropping the user's request.
+
+## 🛠️ Free-Tier Technology Stack
 
 | Component | Choice | Cost |
 |---|---|---|
-| Router SLM (local) | `qwen2.5:1.5b` via [Ollama](https://ollama.com) | free, runs on CPU or GPU |
-| Low-cost tier | same local model (`LOW_PROVIDER=ollama`) | free |
-| High-cost tier | `openai/gpt-oss-120b` on [Groq](https://console.groq.com) free tier | free, rate-limited |
-| Dataset | [`routellm/gpt4_dataset`](https://huggingface.co/datasets/routellm/gpt4_dataset) (~119k GPT-4-judged prompts) | free |
+| **Router Service** | FastAPI (Python) + Scikit-Learn | Free (Local) |
+| **Low-cost Tier** | Local model (e.g., `qwen2.5:1.5b` via Ollama) | Free (Local compute) |
+| **High-cost Tier** | `openai/gpt-oss-120b` via Groq | Free (Rate-limited) |
+| **Dataset** | [`routellm/gpt4_dataset`](https://huggingface.co/datasets/routellm/gpt4_dataset) | Free |
 
-> **Why not Llama-3.x on Groq?** Groq announced shutdown of `llama-3.1-8b-instant` and
-> `llama-3.3-70b-versatile` on 2026-08-16 and recommends `openai/gpt-oss-20b` /
-> `openai/gpt-oss-120b`. Model catalogs on free tiers change often, so every model name
-> is a setting in `.env`, and `make verify` lists what your key can actually use.
+## 📦 Installation & Setup
 
-## How the dataset becomes routing labels
+1. **Clone the repository and enter the directory:**
+   ```bash
+   git clone <your-repo-url> llm-smart-router
+   cd llm-smart-router
+   ```
 
-Each row of `routellm/gpt4_dataset` has a `prompt` and a `mixtral_score` (1-5): how good
-a *weak* model's answer was, as judged by GPT-4.
+2. **Set up the virtual environment and install dependencies:**
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
 
-| mixtral_score | complexity | routing label |
-|---|---|---|
-| 5 | simple | `low` |
-| 4 | medium | `low` |
-| 1-3 | complex | `high` |
+3. **Configure Environment Variables:**
+   Rename `.env.example` to `.env` (or create a new `.env` file) and add your Groq API key:
+   ```env
+   HIGH_API_KEY=gsk_your_api_key_here
+   ```
 
-Change the cut-off with `WEAK_SCORE_THRESHOLD` in `.env`.
-Splits: `test` = the dataset's own validation split (held out), `train`/`val` = 90/10
-stratified split of its train split. Duplicates and train/test overlap are removed.
+## 🧠 Phase 2 Execution (Training & Serving)
 
-## Quick start (Ubuntu 22.04 / 24.04)
-
-```bash
-git clone <your-repo-url> llm-smart-router && cd llm-smart-router
-
-bash scripts/setup_ubuntu.sh        # apt deps, venv, Ollama, pulls the model(s)
-
-# get a free key (email only): https://console.groq.com/keys
-nano .env                           # set HIGH_API_KEY=gsk_...
-
-source .venv/bin/activate
-make test                           # offline unit tests
-make data                           # download + label the dataset (~300 MB)
-make verify                         # Phase 1 exit-criteria check
-make bench                          # cold vs warm router latency
-make eval                           # zero-shot SLM routing accuracy (200 prompts)
-```
-
-### Phase 1 exit criteria (`make verify`)
-
-1. Ollama is running and the router model is installed
-2. Router answers under `ROUTER_LATENCY_BUDGET_MS` (warm p50) with valid JSON
-3. Low tier reachable
-4. High tier reachable through the API
-5. Dataset prepared (`data/processed/{train,val,test}.parquet`)
-
-## Push to GitHub
+The project includes a `Makefile` to simplify all critical operations. Run these sequentially from within your activated virtual environment:
 
 ```bash
-# Option A - create an EMPTY repo on github.com/new first, then:
-bash scripts/push_to_github.sh https://github.com/<user>/<repo>.git
-# (password prompt = a Personal Access Token with `repo` scope)
+# 1. Run offline unit tests to ensure environment stability
+make test
 
-# Option B - GitHub CLI
-sudo apt install -y gh && gh auth login
-bash scripts/push_to_github.sh
-```
-`.env` (your key) and `data/`, `results/` are git-ignored.
+# 2. Download and label the dataset (creates train, val, and test splits)
+make data
 
-## Layout
+# 3. Train the classifier and calibrate cost/quality thresholds
+make train
 
-```
-smartrouter/
-  config.py       settings from .env
-  clients.py      OllamaClient, OpenAICompatClient (Groq etc.), 429 back-off
-  slm_router.py   router prompt + JSON parsing, safe fallback -> HIGH tier
-  router.py       SLMRouter: query -> RouteDecision
-  labels.py       mixtral_score -> complexity / tier
-scripts/
-  setup_ubuntu.sh  prepare_dataset.py  verify_phase1.py
-  benchmark_slm.py  eval_slm_routing.py  push_to_github.sh
-tests/            offline unit tests (labels, parsing)
+# 4. Evaluate the trained artifact against the validation set
+make eval-classifier
+
+# 5. Start the FastAPI Router Service on localhost:8000
+make serve
 ```
 
-## Troubleshooting
+## 📡 API Usage (`POST /route`)
 
-| Symptom | Fix |
-|---|---|
-| `Ollama is not reachable` | `sudo systemctl start ollama` or `ollama serve &` |
-| Router latency above budget on CPU | `ROUTER_MODEL=qwen2.5:0.5b`, or raise `ROUTER_LATENCY_BUDGET_MS`. A BERT-style classifier in Phase 2 brings this to ms. |
-| `HTTP 401` from the high tier | wrong/missing `HIGH_API_KEY` |
-| `HTTP 404`/"model not offered" | model was renamed; pick one from the list `make verify` prints and set `HIGH_MODEL` |
-| `HTTP 429` | free-tier rate limit (about 30 requests/min); wait a minute |
-| No GPU / low RAM | keep `qwen2.5:1.5b` or `0.5b`; both run on CPU |
-| Want a different free high tier | any OpenAI-compatible endpoint: set `HIGH_BASE_URL`, `HIGH_API_KEY`, `HIGH_MODEL` |
+While `make serve` is running, you can interact with the router via REST API.
 
-## Next: Phase 2
+**Check Health Status:**
+```bash
+curl -s http://localhost:8000/health | python3 -m json.tool
+```
 
-Train a lightweight classifier on `train.parquet` (predict P(strong needed)), calibrate the
-threshold on `val.parquet`, report the cost-vs-quality curve on `test.parquet`, and expose
-`POST /route`. The zero-shot numbers from `make eval` are the baseline to beat.
+**Route a Simple Query (Defaults to Low Tier):**
+```bash
+curl -s -X POST http://localhost:8000/route \
+     -H "Content-Type: application/json" \
+     -d '{"query": "What is the capital of France?", "explain": true}'
+```
+
+**Route a Complex Query (Triggers High Tier):**
+*Note: Use double-backslashes (`\\`) to properly escape JSON characters like `\sum`.*
+```bash
+curl -s -X POST http://localhost:8000/route \
+     -H "Content-Type: application/json" \
+     -d '{"query": "Provide a rigorous mathematical proof using LaTeX \\sum for the time complexity of merging overlapping intervals.", "explain": true}'
+```
+
+**Override Thresholds Manually:**
+```bash
+curl -s -X POST http://localhost:8000/route \
+     -H "Content-Type: application/json" \
+     -d '{"query": "Write a Python function.", "threshold": 0.04, "explain": true}'
+```
+
+## 📂 Project Structure
+
+```text
+llm-smart-router/
+├── smartrouter/          # Core routing logic, feature extractors, and API routes
+│   ├── api.py            # FastAPI application and endpoints
+│   ├── classifier_router.py # Trained ML router
+│   ├── rules.py          # Fallback heuristic router
+│   └── training.py       # Model training and calibration pipeline
+├── scripts/              # Executable scripts for dataset prep, training, and pushing
+├── tests/                # Pytest suite for curves, features, labels, and pipelines
+├── data/processed/       # Local storage for parquet dataset splits
+├── results/              # Output directory for the trained .joblib artifact and metrics
+├── Makefile              # Command orchestration
+└── requirements.txt      # Python dependencies
+```
+
+## ☁️ Deployment
+
+To push this project to a new GitHub repository, utilize the provided deployment script:
+```bash
+bash scripts/push_to_github.sh [https://github.com/](https://github.com/)<your-username>/<your-repo-name>.git
+```
+*(Note: Data, results, and `.env` files are automatically `.gitignore`d to protect secrets and save space).*
