@@ -1,16 +1,16 @@
 .PHONY: test data train eval-classifier serve clean
 
 test:
-	PYTHONPATH=. pytest tests/
+	pytest tests/
 
 data:
-	python scripts/prepare_dataset.py
+	python3 scripts/prepare_dataset.py
 
 train:
-	python scripts/train_classifier.py
+	python3 scripts/train_classifier.py
 
 eval-classifier:
-	python scripts/eval_classifier_routing.py
+	python3 scripts/eval_classifier_routing.py
 
 serve:
 	uvicorn smartrouter.api:app --host 0.0.0.0 --port 8000 --reload
