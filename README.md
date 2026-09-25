@@ -2,14 +2,15 @@
 
 A cost-optimization gateway that intelligently intercepts user queries, evaluates their complexity using a locally trained classifier, and routes them to either a low-cost or high-cost large language model (LLM) tier. This project is inspired by [RouteLLM](https://github.com/lm-sys/RouteLLM).
 
-**Current Status:** Phase 1 (Dataset & Baseline) and Phase 2 (Trained Classifier & FastAPI Router Service) are complete.
+**Current Status:** Phase 3 (Gateway, Frontend, and Streaming) is complete.
 
 ## 🚀 Features
 
 * **Intelligent Routing:** Uses a custom Logistic Regression classifier trained on TF-IDF features and handcrafted domain signals (e.g., code presence, LaTeX math, reasoning keywords) to predict if a query requires a premium LLM.
-* **Cost vs. Quality Control:** Operators can choose routing presets (`aggressive`, `balanced`, `conservative`) or pass explicit thresholds to dynamically balance API costs against response quality.
+* **Streaming UI with LaTeX & Code Formatting:** A plain HTML/JS frontend utilizing Server-Sent Events (SSE) with robust MathJax LaTeX rendering and Markdown code blocks.
+* **Auto-Continue Engine:** The backend gateway seamlessly detects API length truncations on the free tier and automatically resumes generation.
+* **Cost vs. Quality Control:** Operators can choose routing presets (`aggressive`, `balanced`, `conservative`) or pass explicit thresholds.
 * **FastAPI Service:** Exposes a high-performance `POST /route` endpoint with single-digit millisecond latency overhead.
-* **Safe Fallbacks:** If the classifier artifact is missing or fails to parse a query, the system gracefully degrades to a deterministic, rule-based heuristic router without dropping the user's request.
 
 ## 🛠️ Free-Tier Technology Stack
 
@@ -41,30 +42,32 @@ A cost-optimization gateway that intelligently intercepts user queries, evaluate
    HIGH_API_KEY=gsk_your_api_key_here
    ```
 
-## 🧠 Phase 2 Execution (Training & Serving)
+## 🧠 Phase 2 — Router Classifier
 
-The project includes a `Makefile` to simplify all critical operations. Run these sequentially from within your activated virtual environment:
-
+Train the model and generate the `router_artifact.joblib`.
 ```bash
-# 1. Run offline unit tests to ensure environment stability
-make test
-
-# 2. Download and label the dataset (creates train, val, and test splits)
-make data
-
-# 3. Train the classifier and calibrate cost/quality thresholds
-make train
-
-# 4. Evaluate the trained artifact against the validation set
-make eval-classifier
-
-# 5. Start the FastAPI Router Service on localhost:8000
-make serve
+make data            # Download and split the dataset
+make train-router    # Fits logistic regression & calibrates presets
+make eval-router     # Generates cost-vs-quality curve on test split
 ```
 
-## 📡 API Usage (`POST /route`)
+## 🌐 Phase 3 — Gateway & Frontend
 
-While `make serve` is running, you can interact with the router via REST API.
+Wires up the full path: **browser → gateway → router → selected tier → streamed back**.
+
+```bash
+# Option A - single service (simplest: router runs in-process inside the gateway)
+make serve-gateway                # -> http://localhost:8000 (UI served here)
+
+# Option B - router as its own scalable service
+make serve-router                 # terminal 1 -> http://localhost:8001
+# (set ROUTER_SERVICE_URL=http://localhost:8001 in .env)
+make serve-gateway                # terminal 2 -> http://localhost:8000
+```
+
+Open **http://localhost:8000** in your browser. Type a prompt, watch it stream in, see the MathJax formatting apply, and observe which tier answered (LOW/HIGH badge).
+
+## 📡 API Usage (`POST /route`)
 
 **Check Health Status:**
 ```bash
@@ -73,47 +76,43 @@ curl -s http://localhost:8000/health | python3 -m json.tool
 
 **Route a Simple Query (Defaults to Low Tier):**
 ```bash
-curl -s -X POST http://localhost:8000/route \
+curl -s -X POST http://localhost:8000/api/chat/stream \
      -H "Content-Type: application/json" \
      -d '{"query": "What is the capital of France?", "explain": true}'
 ```
 
 **Route a Complex Query (Triggers High Tier):**
-*Note: Use double-backslashes (`\\`) to properly escape JSON characters like `\sum`.*
+*(Note: Use double-backslashes `\\` to properly escape JSON characters like `\sum`)*
 ```bash
-curl -s -X POST http://localhost:8000/route \
+curl -s -X POST http://localhost:8000/api/chat/stream \
      -H "Content-Type: application/json" \
      -d '{"query": "Provide a rigorous mathematical proof using LaTeX \\sum for the time complexity of merging overlapping intervals.", "explain": true}'
-```
-
-**Override Thresholds Manually:**
-```bash
-curl -s -X POST http://localhost:8000/route \
-     -H "Content-Type: application/json" \
-     -d '{"query": "Write a Python function.", "threshold": 0.04, "explain": true}'
 ```
 
 ## 📂 Project Structure
 
 ```text
 llm-smart-router/
-├── smartrouter/          # Core routing logic, feature extractors, and API routes
-│   ├── api.py            # FastAPI application and endpoints
-│   ├── classifier_router.py # Trained ML router
-│   ├── rules.py          # Fallback heuristic router
-│   └── training.py       # Model training and calibration pipeline
+├── frontend/             # Phase 3: HTML/CSS/JS streaming UI (No build step)
+├── gateway/              # Phase 3: FastAPI gateway, SSE streaming, caching, auto-continue
+├── smartrouter/          # Phase 1/2: Core routing logic, feature extractors, API routes
 ├── scripts/              # Executable scripts for dataset prep, training, and pushing
 ├── tests/                # Pytest suite for curves, features, labels, and pipelines
-├── data/processed/       # Local storage for parquet dataset splits
-├── results/              # Output directory for the trained .joblib artifact and metrics
+├── data/                 # Local storage for parquet dataset splits
+├── results/              # Output directory for the trained .joblib artifact and logs
 ├── Makefile              # Command orchestration
 └── requirements.txt      # Python dependencies
 ```
 
 ## ☁️ Deployment
 
-To push this project to a new GitHub repository, utilize the provided deployment script:
+To push updates to your GitHub repository:
 ```bash
-bash scripts/push_to_github.sh [https://github.com/](https://github.com/)<your-username>/<your-repo-name>.git
+# Data, results, and .env files are automatically .gitignored to protect secrets.
+git add .
+git commit -m "Your message"
+git push origin main
 ```
-*(Note: Data, results, and `.env` files are automatically `.gitignore`d to protect secrets and save space).*
+
+## 🚀 Next: Phase 4
+Containerize (`router_service/`, `gateway/`, `frontend/` into Docker images), add Prometheus/Grafana over `results/gateway_log.jsonl`, load-test with k6/Locust, and wire up CI/CD for `router_artifact.joblib` updates.
