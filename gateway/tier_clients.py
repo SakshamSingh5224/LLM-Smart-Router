@@ -5,9 +5,9 @@ gateway is an async FastAPI service that must stream tokens to the browser as
 they arrive, so it gets its own async httpx clients here rather than reusing
 those.
 
-* OllamaStreamClient       - local model via Ollama (low tier by default)
+* OllamaStreamClient        - local model via Ollama (low tier by default)
 * OpenAICompatStreamClient - any OpenAI-compatible SSE endpoint (Groq by default,
-                              used for the high tier)
+                             used for the high tier)
 """
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ class OllamaStreamClient:
         self.host = host.rstrip("/")
         self.model = model
 
-    async def stream_chat(self, messages: list[dict], *, max_tokens: int = 512,
+    async def stream_chat(self, messages: list[dict], *, max_tokens: int = 8192,
                            temperature: float = 0.7) -> AsyncIterator[StreamChunk]:
         payload = {
             "model": self.model, "messages": messages, "stream": True,
@@ -87,58 +87,108 @@ class OpenAICompatStreamClient:
         self.model = model
         self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    async def stream_chat(self, messages: list[dict], *, max_tokens: int = 512,
-                           temperature: float = 0.7, retries: int = 2) -> AsyncIterator[StreamChunk]:
-        payload: dict = {
-            "model": self.model, "messages": messages, "stream": True,
-            "temperature": temperature, "max_completion_tokens": max_tokens,
-        }
-        if "gpt-oss" in self.model:
-            payload["reasoning_effort"] = "low"
+    async def stream_chat(self, messages: list[dict], *, max_tokens: int = 8192,
+                           temperature: float = 0.7, retries: int = 2, max_continuations: int = 3) -> AsyncIterator[StreamChunk]:
+        
+        # Keep track of the full conversation history for continuations
+        current_messages = list(messages)
+        
+        # Allow the model to Auto-Continue up to 'max_continuations' times
+        for cont_idx in range(max_continuations + 1):
+            payload: dict = {
+                "model": self.model, 
+                "messages": current_messages, 
+                "stream": True,
+                "temperature": temperature, 
+                "max_tokens": max_tokens,
+            }
+            if "gpt-oss" in self.model:
+                payload["reasoning_effort"] = "low"
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=10.0)) as client:
-            for attempt in range(retries + 1):
-                try:
-                    async with client.stream("POST", f"{self.base_url}/chat/completions",
-                                              headers=self._headers, json=payload) as r:
-                        if r.status_code == 429 and attempt < retries:
-                            wait = float(r.headers.get("retry-after", 2 * (attempt + 1)))
-                            await self._sleep(min(wait, 20.0))
-                            continue
-                        if r.status_code != 200:
-                            body = (await r.aread()).decode("utf-8", "ignore")[:300]
-                            yield StreamChunk(error=f"HTTP {r.status_code}: {body}")
-                            return
-                        async for line in r.aiter_lines():
-                            line = line.strip()
-                            if not line or not line.startswith("data:"):
+            assistant_text_this_round = ""
+            finish_reason = None
+            request_success = False
+
+            async with httpx.AsyncClient(timeout=None) as client:
+                for attempt in range(retries + 1):
+                    try:
+                        async with client.stream("POST", f"{self.base_url}/chat/completions",
+                                                  headers=self._headers, json=payload) as r:
+                            
+                            # Handle rate limits
+                            if r.status_code == 429 and attempt < retries:
+                                wait = float(r.headers.get("retry-after", 2 * (attempt + 1)))
+                                await self._sleep(min(wait, 20.0))
                                 continue
-                            payload_str = line[len("data:"):].strip()
-                            if payload_str == "[DONE]":
-                                yield StreamChunk(done=True)
+                            
+                            # Handle normal errors
+                            if r.status_code != 200:
+                                body = (await r.aread()).decode("utf-8", "ignore")[:300]
+                                yield StreamChunk(error=f"HTTP {r.status_code}: {body}")
                                 return
-                            try:
-                                obj = json.loads(payload_str)
-                            except json.JSONDecodeError:
-                                continue
-                            choice = (obj.get("choices") or [{}])[0]
-                            piece = (choice.get("delta") or {}).get("content") or ""
-                            if piece:
-                                yield StreamChunk(delta=piece)
-                            if choice.get("finish_reason"):
-                                yield StreamChunk(done=True)
+                            
+                            # Parse the SSE Stream
+                            async for line in r.aiter_lines():
+                                line = line.strip()
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                
+                                payload_str = line[len("data:"):].strip()
+                                
+                                if payload_str == "[DONE]":
+                                    if not finish_reason:
+                                        finish_reason = "stop"
+                                    break
+                                
+                                try:
+                                    obj = json.loads(payload_str)
+                                except json.JSONDecodeError:
+                                    continue
+                                
+                                choice = (obj.get("choices") or [{}])[0]
+                                piece = (choice.get("delta") or {}).get("content") or ""
+                                
+                                if piece:
+                                    assistant_text_this_round += piece
+                                    yield StreamChunk(delta=piece)
+                                
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    finish_reason = fr
+                            
+                            request_success = True
+                            break  # Exit the retry loop if successful
+                    
+                    except httpx.HTTPError as e:
+                        if attempt < retries:
+                            await self._sleep(2 * (attempt + 1))
+                            continue
+                        yield StreamChunk(error=f"connection error: {e}")
                         return
-                except httpx.HTTPError as e:
-                    if attempt < retries:
-                        await self._sleep(2 * (attempt + 1))
-                        continue
-                    yield StreamChunk(error=f"connection error: {e}")
-                    return
+
+            if not request_success:
+                return
+
+            # --- THE AUTO-CONTINUE LOGIC ---
+            # If the API cut us off due to length, and we haven't exceeded our continuation limit:
+            if finish_reason in ("length", "max_tokens") and cont_idx < max_continuations:
+                # 1. Save what the assistant generated in this round
+                current_messages.append({"role": "assistant", "content": assistant_text_this_round})
+                
+                # 2. Add a hidden system prompt instructing it to seamlessly resume
+                current_messages.append({
+                    "role": "user", 
+                    "content": "Your response was cut off due to length. Please continue EXACTLY from where you left off. Do not include any introductory or transition text, just provide the very next word or character."
+                })
+                # The loop will now restart, firing a new API request invisibly.
+            else:
+                # We finished naturally, or hit the absolute continuation limit
+                yield StreamChunk(done=True)
+                return
 
     @staticmethod
     async def _sleep(s: float) -> None:
         import asyncio
-
         await asyncio.sleep(s)
 
 
