@@ -1,0 +1,58 @@
+# Phase 4 local stack: router_service (:8001) + gateway (:8000, serves the frontend)
+# + Prometheus (:9090) + Grafana (:3000).
+#
+# Prereqs: `make train-router` once, so results/router_artifact.joblib exists
+# (both images COPY it in at build time).
+#
+# Run:      docker compose -f docker/docker-compose.yml --env-file ../.env up --build
+# Chaos:    docker compose -f docker/docker-compose.yml kill router_service
+# Stop:     docker compose -f docker/docker-compose.yml down
+
+services:
+  router_service:
+    build:
+      context: ..
+      dockerfile: docker/router_service.Dockerfile
+    ports: ["8001:8001"]
+    environment:
+      GATEWAY_CORS_ORIGINS: "*"
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: docker/gateway.Dockerfile
+    ports: ["8000:8000"]
+    environment:
+      # Talk to the router_service container over the compose network -
+      # demonstrates the plan's "router scales independently of the gateway".
+      ROUTER_SERVICE_URL: "http://router_service:8001"
+      LOW_PROVIDER: "${LOW_PROVIDER:-openai_compat}"
+      LOW_BASE_URL: "${LOW_BASE_URL:-https://api.groq.com/openai/v1}"
+      LOW_MODEL: "${LOW_MODEL:-openai/gpt-oss-20b}"
+      LOW_API_KEY: "${LOW_API_KEY:-${HIGH_API_KEY}}"
+      HIGH_BASE_URL: "${HIGH_BASE_URL:-https://api.groq.com/openai/v1}"
+      HIGH_MODEL: "${HIGH_MODEL:-openai/gpt-oss-120b}"
+      HIGH_API_KEY: "${HIGH_API_KEY:?set HIGH_API_KEY in .env}"
+      GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
+      GATEWAY_CORS_ORIGINS: "*"
+    depends_on: [router_service]
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [gateway, router_service]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on: [prometheus]

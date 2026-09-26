@@ -50,6 +50,4 @@ Setup complete. Next:
   2. source .venv/bin/activate
   3. make data      # download + label the RouteLLM dataset
   4. make verify    # Phase 1 exit-criteria check
-  5. make bench && make eval   # Phase 1 latency + zero-shot baseline
-  6. make train && make eval-classifier && make serve   # Phase 2: trained classifier + POST /route
 MSG

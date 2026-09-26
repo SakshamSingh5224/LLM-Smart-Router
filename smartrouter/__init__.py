@@ -1,3 +1,3 @@
-"""LLM Smart Routing & Cost Optimization - Phase 1 (SLM router) + Phase 2 (trained classifier)."""
+"""LLM Smart Routing & Cost Optimization - Phase 1 building blocks."""
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"

@@ -28,11 +28,18 @@ class GatewaySettings:
     log_path: Path = ROOT / "results" / "gateway_log.jsonl"
     cost_per_1k_low: float = 0.0        # both free tiers by default -> $0
     cost_per_1k_high: float = 0.0
+    api_key: str = ""                   # if set, /api/* requires header X-API-Key: <this>
+    rate_limit_per_min: int = 30        # per API key (or per IP if no key configured)
 
     def __post_init__(self):
         override = os.getenv("GATEWAY_LOG_PATH")
         if override:
             object.__setattr__(self, "log_path", Path(override))
+        url = self.router_service_url
+        if url and not url.startswith(("http://", "https://")):
+            # Some hosts (e.g. Render's `hostport` service reference) return a
+            # bare host:port with no scheme - assume plain HTTP on that case.
+            object.__setattr__(self, "router_service_url", f"http://{url}")
 
 
 def load_gateway_settings() -> GatewaySettings:
@@ -53,4 +60,6 @@ def load_gateway_settings() -> GatewaySettings:
         cors_origins=["*"] if origins.strip() == "*" else [o.strip() for o in origins.split(",") if o.strip()],
         cost_per_1k_low=float(e("COST_PER_1K_LOW", "0.0")),
         cost_per_1k_high=float(e("COST_PER_1K_HIGH", "0.0")),
+        api_key=e("GATEWAY_API_KEY", ""),
+        rate_limit_per_min=int(e("GATEWAY_RATE_LIMIT_PER_MIN", "30")),
     )

@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
+from prometheus_fastapi_instrumentator import Instrumentator  # noqa: E402
 
 from gateway.router_loader import load_router  # noqa: E402
 from gateway.settings import load_gateway_settings  # noqa: E402
@@ -35,6 +36,7 @@ log.info("Router status: %s", router_status)
 
 app = FastAPI(title="LLM Smart Router - Router Service", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=cfg.cors_origins, allow_methods=["*"], allow_headers=["*"])
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 class RouteRequest(BaseModel):

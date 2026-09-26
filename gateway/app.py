@@ -25,15 +25,17 @@ from typing import AsyncIterator, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx  # noqa: E402
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import FastAPI, HTTPException, Depends  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
+from prometheus_fastapi_instrumentator import Instrumentator  # noqa: E402
 
 from gateway.cache import ResponseCache  # noqa: E402
 from gateway.logging_utils import JsonlLogger, RequestLog, now_id  # noqa: E402
 from gateway.router_loader import load_router  # noqa: E402
+from gateway.security import make_guard  # noqa: E402
 from gateway.settings import load_gateway_settings  # noqa: E402
 from gateway.tier_clients import StreamChunk, collect_stream, make_high_stream_client, make_low_stream_client  # noqa: E402
 from smartrouter.labels import HIGH, LOW  # noqa: E402
@@ -53,6 +55,14 @@ _http = httpx.AsyncClient(timeout=cfg.router_timeout_s)
 
 app = FastAPI(title="LLM Smart Router - Gateway", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=cfg.cors_origins, allow_methods=["*"], allow_headers=["*"])
+
+# Prometheus metrics at GET /metrics (request count, latency histograms, in-progress) —
+# scraped by prometheus.yml, visualized in Grafana.
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+
+# Public-internet gate: require X-API-Key (if GATEWAY_API_KEY is set) + per-key rate limit.
+# No-op locally unless you set GATEWAY_API_KEY in .env.
+api_guard = make_guard(cfg.api_key or None, cfg.rate_limit_per_min)
 
 SYSTEM_PROMPT = "You are a helpful, concise assistant."
 
@@ -160,7 +170,7 @@ def recent_logs(n: int = 20):
     return jlog.tail(min(n, 200))
 
 
-@app.post("/api/chat", response_model=ChatResponse)
+@app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(api_guard)])
 async def chat(req: ChatRequest):
     """Non-streaming endpoint: full answer in one JSON response."""
     t0 = time.perf_counter()
@@ -201,7 +211,7 @@ async def chat(req: ChatRequest):
     )
 
 
-@app.post("/api/chat/stream")
+@app.post("/api/chat/stream", dependencies=[Depends(api_guard)])
 async def chat_stream(req: ChatRequest):
     """SSE endpoint: `meta` event with the routing decision, then `delta` events per
     token chunk, then a final `done` event with latency/cost totals."""

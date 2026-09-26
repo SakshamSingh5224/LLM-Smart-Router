@@ -14,3 +14,7 @@ fastembed>=0.3   # optional embedding backend; tfidf backend works without it
 fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.6
+
+# Phase 4 - observability, rate limiting, load testing
+prometheus-fastapi-instrumentator>=7.0
+locust>=2.24

@@ -9,7 +9,15 @@ const modeSel = document.getElementById("mode");
 const explainBox = document.getElementById("explain");
 const healthDot = document.getElementById("health");
 
-const API_BASE = ""; // same-origin: gateway serves this file
+// Same-origin by default (gateway serves this file itself, e.g. Render single-service).
+// For a split deploy (this frontend on Vercel, gateway on Render), config.js sets
+// window.API_BASE = "https://your-gateway.onrender.com" before this script loads.
+const API_BASE = window.API_BASE || "";
+const API_KEY = window.API_KEY || ""; // set alongside API_BASE in config.js if GATEWAY_API_KEY is enabled
+
+function authHeaders(extra) {
+  return API_KEY ? { ...extra, "X-API-Key": API_KEY } : extra;
+}
 
 function el(tag, cls, text) {
   const n = document.createElement(tag);
@@ -71,13 +79,12 @@ async function streamChat(query, mode, explain) {
   const { meta, bubble } = addAssistantMessage();
   const t0 = performance.now();
   let decision = null;
-  let fullResponse = "";
 
   let resp;
   try {
     resp = await fetch(`${API_BASE}/api/chat/stream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ query, mode, explain }),
     });
   } catch (e) {
@@ -95,81 +102,44 @@ async function streamChat(query, mode, explain) {
   const decoder = new TextDecoder();
   let buf = "";
 
-  try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
 
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) !== -1) {
-        const raw = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const lines = raw.split("\n");
-        let event = "message", data = "";
-        for (const line of lines) {
-          if (line.startsWith("event:")) event = line.slice(6).trim();
-          else if (line.startsWith("data:")) data = line.slice(5).trim();
-        }
-        if (!data) continue;
-        let payload;
-        try {
-          payload = JSON.parse(data);
-        } catch {
-          continue;
-        }
-
-        if (event === "meta") {
-          decision = payload.decision;
-          renderMeta(meta, decision);
-        } else if (event === "delta") {
-          fullResponse += payload.text;
-
-          // --- MAGIC FIX 3.0: Catch $,$$, \[, and \( ---
-          let mathBlocks = [];
-          let text = fullResponse;
-          
-          // 1. Extract Display Math: \[...\] or $$...$$
-          text = text.replace(/\\\[([\s\S]*?)\\\]|\$\$([\s\S]*?)\$\$/g, (match, p1, p2) => {
-              const inner = p1 !== undefined ? p1 : p2;
-              mathBlocks.push(`\\[${inner}\\]`); // Convert to MathJax format
-              return `MATHBLOCK${mathBlocks.length - 1}XYZ`;
-          });
-          
-          // 2. Extract Inline Math: \(...\) or $...$
-          // (The regex ensures we don't accidentally match normal currency like "$5 and $10")
-          text = text.replace(/\\\(([\s\S]*?)\\\)|\$([^\s\$][^\$]*?[^\s\$]|[^\s\$])\$/g, (match, p1, p2) => {
-              const inner = p1 !== undefined ? p1 : p2;
-              mathBlocks.push(`\\(${inner}\\)`); // Convert to MathJax format
-              return `MATHBLOCK${mathBlocks.length - 1}XYZ`;
-          });
-
-          // 3. Parse Markdown safely (no backslashes get stripped now)
-          let html = marked.parse(text);
-
-          // 4. Inject the MathJax-ready blocks back in
-          for (let i = 0; i < mathBlocks.length; i++) {
-              html = html.replace(`MATHBLOCK${i}XYZ`, mathBlocks[i]);
-          }
-
-          bubble.innerHTML = html;
-          thread.scrollTop = thread.scrollHeight;
-
-        } else if (event === "error") {
-          bubble.classList.add("error-bubble");
-          bubble.innerHTML += `<br><strong>[error: ${payload.message}]</strong>`;
-        } else if (event === "done") {
-          const ms = Math.round(performance.now() - t0);
-          const cacheNote = payload.cache_hit ? " · from cache" : "";
-          const costNote = payload.est_cost_usd > 0 ? ` · ~$${payload.est_cost_usd.toFixed(5)}` : "";
-          renderMeta(meta, decision, `${ms} ms${cacheNote}${costNote}`);
-        }
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) !== -1) {
+      const raw = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const lines = raw.split("\n");
+      let event = "message", data = "";
+      for (const line of lines) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        else if (line.startsWith("data:")) data = line.slice(5).trim();
       }
-    }
-  } finally {
-    // Guarantee MathJax renders at the end, even if the API forcefully truncates the response
-    if (window.MathJax) {
-      MathJax.typesetPromise([bubble]).catch((err) => console.error(err));
+      if (!data) continue;
+      let payload;
+      try {
+        payload = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      if (event === "meta") {
+        decision = payload.decision;
+        renderMeta(meta, decision);
+      } else if (event === "delta") {
+        bubble.textContent += payload.text;
+        thread.scrollTop = thread.scrollHeight;
+      } else if (event === "error") {
+        bubble.classList.add("error-bubble");
+        bubble.textContent += `\n[error: ${payload.message}]`;
+      } else if (event === "done") {
+        const ms = Math.round(performance.now() - t0);
+        const cacheNote = payload.cache_hit ? " · from cache" : "";
+        const costNote = payload.est_cost_usd > 0 ? ` · ~$${payload.est_cost_usd.toFixed(5)}` : "";
+        renderMeta(meta, decision, `${ms} ms${cacheNote}${costNote}`);
+      }
     }
   }
 }

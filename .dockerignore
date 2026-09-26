@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.github/
+data/
+results/*.csv
+results/*.png
+results/gateway_log.jsonl
+tests/
+loadtest/
+docker/grafana/
+*.md
+.env

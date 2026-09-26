@@ -1,0 +1,61 @@
+# Render Blueprint. In the Render dashboard: New > Blueprint > connect this repo.
+# Render auto-detects this file at the repo root and proposes both services.
+# You still set the *Key (secret) env vars in the dashboard - never commit them.
+#
+# IMPORTANT: both Dockerfiles COPY results/router_artifact.joblib at build time.
+# Run `make train-router` locally and `git add -f results/router_artifact.joblib`
+# (it's .gitignore'd by default - force-add just this one file) BEFORE Render builds,
+# or Render's build will fail with "file not found".
+
+services:
+  - type: web
+    name: llm-router-service
+    runtime: docker
+    dockerfilePath: ./docker/router_service.Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    # This is public on Render's free tier (no private networking on free plans),
+    # so anyone who finds this URL can also call POST /route directly. That's low
+    # risk (it only returns a routing decision, not an LLM answer, and costs
+    # nothing) but if you want it locked down, add the same gateway/security.py
+    # guard here with its own ROUTER_API_KEY.
+    envVars:
+      - key: GATEWAY_CORS_ORIGINS
+        value: "*"
+
+  - type: web
+    name: llm-gateway
+    runtime: docker
+    dockerfilePath: ./docker/gateway.Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: ROUTER_SERVICE_URL
+        fromService:
+          type: web
+          name: llm-router-service
+          envVarKey: RENDER_EXTERNAL_URL   # full https://llm-router-service-xxxx.onrender.com
+      - key: LOW_PROVIDER
+        value: openai_compat
+      - key: LOW_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: LOW_MODEL
+        value: openai/gpt-oss-20b
+      - key: LOW_API_KEY
+        sync: false            # set manually in the dashboard (your Groq key)
+      - key: HIGH_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: HIGH_MODEL
+        value: openai/gpt-oss-120b
+      - key: HIGH_API_KEY
+        sync: false            # set manually in the dashboard (your Groq key)
+      - key: GATEWAY_API_KEY
+        sync: false            # set manually - your own secret; required by the frontend/k6 as X-API-Key
+      - key: GATEWAY_CORS_ORIGINS
+        value: "*"             # tighten to your Vercel domain once you have it, e.g. https://your-app.vercel.app
+      - key: GATEWAY_CACHE_ENABLED
+        value: "true"
+      - key: ROUTER_MODE
+        value: balanced
