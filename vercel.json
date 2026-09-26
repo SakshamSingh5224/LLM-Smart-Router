@@ -4,7 +4,7 @@
   "rewrites": [
     {
       "source": "/api/:path(.*)",
-      "destination": "https://llm-router-service.onrender.com/api/:path"
+      "destination": "https://llm-gateway-62xo.onrender.com/api/:path"
     }
   ]
 }
