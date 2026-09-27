@@ -18,3 +18,4 @@ pydantic>=2.6
 # Phase 4 - observability, rate limiting, load testing
 prometheus-fastapi-instrumentator>=7.0
 locust>=2.24
+prometheus-fastapi-instrumentator>=7.0
