@@ -14,6 +14,12 @@ cap (finish_reason/done_reason == "length"): they transparently open a fresh
 upstream stream with the partial answer fed back as context, and keep yielding
 StreamChunks to the caller as one continuous stream. The caller (gateway/app.py)
 never sees the seam - it only sees `done=True` once the model actually finished.
+
+IMPORTANT: as soon as the real finish_reason is seen, _stream_once returns
+immediately. Groq (like OpenAI) sends a trailing `data: [DONE]` line after the
+line that carries finish_reason - if we kept reading past it, that sentinel
+would yield a second StreamChunk(done=True, finish_reason="stop") that silently
+overwrites a real "length", which is exactly what broke auto-continue before.
 """
 from __future__ import annotations
 
@@ -83,6 +89,7 @@ class OllamaStreamClient:
                             yield StreamChunk(delta=piece)
                         if data.get("done"):
                             yield StreamChunk(done=True, finish_reason=data.get("done_reason") or "stop")
+                            return  # Ollama's own final line - nothing meaningful follows it
             except httpx.HTTPError as e:
                 yield StreamChunk(error=f"ollama connection error: {e}")
 
@@ -152,6 +159,7 @@ class OpenAICompatStreamClient:
                                 continue
                             payload_str = line[len("data:"):].strip()
                             if payload_str == "[DONE]":
+                                # only reached if a finish_reason was never seen on an earlier line
                                 yield StreamChunk(done=True, finish_reason="stop")
                                 return
                             try:
@@ -165,6 +173,7 @@ class OpenAICompatStreamClient:
                             fr = choice.get("finish_reason")
                             if fr:
                                 yield StreamChunk(done=True, finish_reason=fr)
+                                return  # stop immediately - do NOT keep reading into a trailing [DONE]
                         return
                 except httpx.HTTPError as e:
                     if attempt < retries:
