@@ -26,6 +26,27 @@ function el(tag, cls, text) {
   return n;
 }
 
+// Render accumulated raw markdown into a bubble as sanitized, highlighted HTML.
+function renderMarkdown(bubble, raw) {
+  const html = marked.parse(raw, { breaks: true, gfm: true });
+  bubble.innerHTML = DOMPurify.sanitize(html);
+  bubble.querySelectorAll("pre code").forEach((block) => {
+    hljs.highlightElement(block);
+  });
+}
+
+// Cap re-renders at the browser's paint rate instead of re-parsing markdown on
+// every single token - deltas can arrive many times a second during streaming.
+function scheduleRender(state) {
+  if (state.rafPending) return;
+  state.rafPending = true;
+  requestAnimationFrame(() => {
+    state.rafPending = false;
+    renderMarkdown(state.bubble, state.raw);
+    thread.scrollTop = thread.scrollHeight;
+  });
+}
+
 function addUserMessage(text) {
   const msg = el("div", "msg user");
   msg.appendChild(el("div", "bubble", text));
@@ -37,12 +58,12 @@ function addAssistantMessage() {
   const msg = el("div", "msg assistant");
   const meta = el("div", "meta");
   meta.appendChild(el("span", "tier-badge", "routing…"));
-  const bubble = el("div", "bubble", "");
+  const bubble = el("div", "bubble markdown", "");
   msg.appendChild(meta);
   msg.appendChild(bubble);
   thread.appendChild(msg);
   thread.scrollTop = thread.scrollHeight;
-  return { msg, meta, bubble };
+  return { msg, meta, bubble, raw: "", rafPending: false };
 }
 
 function renderMeta(meta, decision, extra) {
@@ -76,7 +97,8 @@ health();
 setInterval(health, 15000);
 
 async function streamChat(query, mode, explain) {
-  const { meta, bubble } = addAssistantMessage();
+  const state = addAssistantMessage();
+  const { meta, bubble } = state;
   const t0 = performance.now();
   let decision = null;
 
@@ -129,12 +151,14 @@ async function streamChat(query, mode, explain) {
         decision = payload.decision;
         renderMeta(meta, decision);
       } else if (event === "delta") {
-        bubble.textContent += payload.text;
-        thread.scrollTop = thread.scrollHeight;
+        state.raw += payload.text;
+        scheduleRender(state);
       } else if (event === "error") {
+        state.raw += `\n\n**[error: ${payload.message}]**`;
+        renderMarkdown(bubble, state.raw);
         bubble.classList.add("error-bubble");
-        bubble.textContent += `\n[error: ${payload.message}]`;
       } else if (event === "done") {
+        renderMarkdown(bubble, state.raw); // force a final render even if a rAF is still pending
         const ms = Math.round(performance.now() - t0);
         const cacheNote = payload.cache_hit ? " · from cache" : "";
         const costNote = payload.est_cost_usd > 0 ? ` · ~$${payload.est_cost_usd.toFixed(5)}` : "";
