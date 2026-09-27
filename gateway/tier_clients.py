@@ -145,9 +145,12 @@ class OpenAICompatStreamClient:
                 try:
                     async with client.stream("POST", f"{self.base_url}/chat/completions",
                                               headers=self._headers, json=payload) as r:
-                        if r.status_code == 429 and attempt < retries:
-                            wait = float(r.headers.get("retry-after", 2 * (attempt + 1)))
-                            await asyncio.sleep(min(wait, 20.0))
+                        if r.status_code in (429, 413) and attempt < retries:
+                            # 429 = per-request rate limit; 413 here = Groq's TPM (tokens-per-minute)
+                            # cap tripped. Neither has a useful retry-after for 413, so back off long
+                            # enough for the rolling 60s window to free up capacity.
+                            wait = float(r.headers.get("retry-after", 15 * (attempt + 1)))
+                            await asyncio.sleep(min(wait, 45.0))
                             continue
                         if r.status_code != 200:
                             body = (await r.aread()).decode("utf-8", "ignore")[:300]
