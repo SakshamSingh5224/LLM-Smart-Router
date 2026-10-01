@@ -22,6 +22,6 @@ locust>=2.24
 # MVP 2 Phase 2A - Identity & Database Foundation
 sqlalchemy>=2.0
 alembic
-passlib[bcrypt]
+bcrypt
 python-jose[cryptography]
 psycopg[binary]
