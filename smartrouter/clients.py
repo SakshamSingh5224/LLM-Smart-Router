@@ -1,7 +1,7 @@
-"""Thin HTTP clients for the three model endpoints used in Phase 1.
+"""Thin HTTP clients for the model endpoints.
 
-* OllamaClient        - local SLM (router + optional low tier)
-* OpenAICompatClient  - any OpenAI-compatible API (Groq free tier by default)
+* OllamaClient        - local SLM (router + optional local low tier)
+* OpenAICompatClient  - any OpenAI-compatible API (Groq, used for both low and high tiers here)
 """
 from __future__ import annotations
 
@@ -42,16 +42,8 @@ class OllamaClient:
         names = self.installed_models()
         return self.model in names or f"{self.model}:latest" in names
 
-    # -- inference --------------------------------------------------------
-    def chat(
-        self,
-        messages: list[dict],
-        *,
-        fmt: Optional[dict] = None,
-        max_tokens: int = 256,
-        temperature: float = 0.0,
-        keep_alive: str = "30m",
-    ) -> ChatResult:
+    # -- inference (with auto-continue on truncation) --------------------
+    def _request(self, messages: list[dict], fmt, max_tokens: int, temperature: float, keep_alive: str):
         payload: dict = {
             "model": self.model,
             "messages": messages,
@@ -61,12 +53,43 @@ class OllamaClient:
         }
         if fmt is not None:
             payload["format"] = fmt
-        t0 = time.perf_counter()
         r = self._http.post(f"{self.host}/api/chat", json=payload)
         r.raise_for_status()
-        ms = (time.perf_counter() - t0) * 1000
         data = r.json()
-        return ChatResult(data.get("message", {}).get("content", ""), ms, self.model, data)
+        text = data.get("message", {}).get("content", "")
+        done_reason = data.get("done_reason")  # "stop" | "length" | ...
+        return text, done_reason, data
+
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        fmt: Optional[dict] = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        keep_alive: str = "30m",
+        max_continuations: int = 6,
+    ) -> ChatResult:
+        working = list(messages)
+        full_text = ""
+        last_raw: dict = {}
+        t0 = time.perf_counter()
+
+        for _ in range(max_continuations + 1):
+            chunk, done_reason, last_raw = self._request(working, fmt, max_tokens, temperature, keep_alive)
+            full_text += chunk
+            if done_reason != "length":
+                break
+            working = working + [
+                {"role": "assistant", "content": chunk},
+                {"role": "user", "content": "Continue exactly where you left off. "
+                                             "Do not repeat anything, do not add any preamble."},
+            ]
+        else:
+            full_text += "\n\n[response truncated after max continuations]"
+
+        ms = (time.perf_counter() - t0) * 1000
+        return ChatResult(full_text.strip() if fmt is None else full_text, ms, self.model, last_raw)
 
     def unload(self) -> None:
         """Evict the model from memory so the next call is a true cold start."""
@@ -79,7 +102,10 @@ class OllamaClient:
 
 
 class OpenAICompatClient:
-    """Minimal /chat/completions client with 429 back-off (free tiers rate-limit)."""
+    """Minimal /chat/completions client with 429 back-off and auto-continue on truncation.
+
+    Used for both the low tier and the high tier here, since both point at Groq.
+    """
 
     def __init__(self, base_url: str, api_key: str, model: str, timeout: float = 90.0):
         self.base_url = base_url.rstrip("/")
@@ -92,14 +118,7 @@ class OpenAICompatClient:
         r.raise_for_status()
         return sorted(m["id"] for m in r.json().get("data", []))
 
-    def chat(
-        self,
-        messages: list[dict],
-        *,
-        max_tokens: int = 256,
-        temperature: float = 0.0,
-        retries: int = 3,
-    ) -> ChatResult:
+    def _request(self, messages: list[dict], max_tokens: int, temperature: float, retries: int):
         payload: dict = {
             "model": self.model,
             "messages": messages,
@@ -109,7 +128,6 @@ class OpenAICompatClient:
         if "gpt-oss" in self.model:
             payload["reasoning_effort"] = "low"  # reasoning models: keep it cheap/fast
 
-        t0 = time.perf_counter()
         for attempt in range(retries + 1):
             r = self._http.post(f"{self.base_url}/chat/completions", headers=self._headers, json=payload)
             if r.status_code == 429 and attempt < retries:
@@ -118,10 +136,41 @@ class OpenAICompatClient:
                 continue
             r.raise_for_status()
             break
-        ms = (time.perf_counter() - t0) * 1000
         data = r.json()
-        text = (data["choices"][0]["message"].get("content") or "").strip()
-        return ChatResult(text, ms, self.model, data)
+        choice = data["choices"][0]
+        text = choice["message"].get("content") or ""
+        finish_reason = choice.get("finish_reason")  # "stop" | "length" | ...
+        return text, finish_reason, data
+
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int = 1024,
+        temperature: float = 0.0,
+        retries: int = 3,
+        max_continuations: int = 6,
+    ) -> ChatResult:
+        working = list(messages)
+        full_text = ""
+        last_raw: dict = {}
+        t0 = time.perf_counter()
+
+        for _ in range(max_continuations + 1):
+            chunk, finish_reason, last_raw = self._request(working, max_tokens, temperature, retries)
+            full_text += chunk
+            if finish_reason != "length":
+                break  # finished naturally - done
+            working = working + [
+                {"role": "assistant", "content": chunk},
+                {"role": "user", "content": "Continue exactly where you left off. "
+                                             "Do not repeat anything, do not add any preamble."},
+            ]
+        else:
+            full_text += "\n\n[response truncated after max continuations]"
+
+        ms = (time.perf_counter() - t0) * 1000
+        return ChatResult(full_text.strip(), ms, self.model, last_raw)
 
 
 def make_low_client(cfg):

@@ -1,4 +1,4 @@
-"""Backend Gateway (Phase 3).
+"""Backend Gateway (Phase 3 & MVP 2 Phase 2A).
 
 Wires up the full request path from user input to final response:
   1. accept a query from the frontend
@@ -8,6 +8,7 @@ Wires up the full request path from user input to final response:
   4. stream the response back to the frontend over Server-Sent Events
   5. log routing decisions, latencies, and estimated cost
   6. serve the static frontend
+  7. Provide JWT authentication and session management
 
 Run:
     uvicorn gateway.app:app --host 0.0.0.0 --port 8000
@@ -25,12 +26,13 @@ from typing import AsyncIterator, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx  # noqa: E402
-from fastapi import FastAPI, HTTPException, Depends  # noqa: E402
+from fastapi import FastAPI, HTTPException, Depends, status  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 from prometheus_fastapi_instrumentator import Instrumentator  # noqa: E402
+from sqlalchemy.orm import Session  # noqa: E402
 
 from gateway.cache import ResponseCache  # noqa: E402
 from gateway.logging_utils import JsonlLogger, RequestLog, now_id  # noqa: E402
@@ -39,6 +41,14 @@ from gateway.security import make_guard  # noqa: E402
 from gateway.settings import load_gateway_settings  # noqa: E402
 from gateway.tier_clients import StreamChunk, collect_stream, make_high_stream_client, make_low_stream_client  # noqa: E402
 from smartrouter.labels import HIGH, LOW  # noqa: E402
+
+# MVP 2 DB & Auth Imports
+from gateway.db.database import engine, Base, get_db
+from gateway.db.models import User, Policy, UserPolicy
+from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user
+
+# Initialize database tables
+Base.metadata.create_all(bind=engine)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gateway")
@@ -56,12 +66,10 @@ _http = httpx.AsyncClient(timeout=cfg.router_timeout_s)
 app = FastAPI(title="LLM Smart Router - Gateway", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=cfg.cors_origins, allow_methods=["*"], allow_headers=["*"])
 
-# Prometheus metrics at GET /metrics (request count, latency histograms, in-progress) —
-# scraped by prometheus.yml, visualized in Grafana.
+# Prometheus metrics at GET /metrics (request count, latency histograms, in-progress)
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 # Public-internet gate: require X-API-Key (if GATEWAY_API_KEY is set) + per-key rate limit.
-# No-op locally unless you set GATEWAY_API_KEY in .env.
 api_guard = make_guard(cfg.api_key or None, cfg.rate_limit_per_min)
 
 SYSTEM_PROMPT = "You are a helpful, concise assistant."
@@ -76,7 +84,6 @@ class ChatRequest(BaseModel):
     use_cache: bool = True
     explain: bool = False
 
-
 class RouteDecisionOut(BaseModel):
     tier: str
     p_strong: float
@@ -85,7 +92,6 @@ class RouteDecisionOut(BaseModel):
     mode: str
     source: str
     reasoning: Optional[str] = None
-
 
 class ChatResponse(BaseModel):
     request_id: str
@@ -97,6 +103,57 @@ class ChatResponse(BaseModel):
     total_latency_ms: float
     tokens_est: int
     est_cost_usd: float
+
+# Auth Request Models
+class UserCreate(BaseModel):
+    email: str
+    password: str
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+
+# --------------------------------------------------------------------------
+# Authentication & Identity Endpoints
+# --------------------------------------------------------------------------
+def seed_default_policies(db: Session):
+    policies = [
+        {"name": "free", "query_threshold": 50, "action_on_exhaustion": "downgrade_to_low"},
+        {"name": "trusted", "query_threshold": 1000, "action_on_exhaustion": "downgrade_to_low"},
+        {"name": "admin", "query_threshold": None, "action_on_exhaustion": "allow_overage"}
+    ]
+    for p in policies:
+        if not db.query(Policy).filter(Policy.name == p["name"]).first():
+            db.add(Policy(**p))
+    db.commit()
+
+@app.post("/api/auth/register")
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    seed_default_policies(db) # Ensure policies exist[cite: 2]
+    if db.query(User).filter(User.email == user.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    hashed_password = get_password_hash(user.password)
+    new_user = User(email=user.email, password_hash=hashed_password)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    free_policy = db.query(Policy).filter(Policy.name == "free").first()
+    db.add(UserPolicy(user_id=new_user.id, policy_id=free_policy.id))
+    db.commit()
+    
+    return {"message": "User created successfully"}
+
+@app.post("/api/auth/login")
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if not db_user or not verify_password(user.password, db_user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    
+    access_token = create_access_token(data={"sub": str(db_user.id)})
+    return {"access_token": access_token, "token_type": "bearer"}
 
 
 # --------------------------------------------------------------------------
@@ -149,7 +206,7 @@ def _log_and_finish(request_id, query, decision, cache_hit, router_ms, gen_ms, t
 
 
 # --------------------------------------------------------------------------
-# Endpoints
+# Core Endpoints
 # --------------------------------------------------------------------------
 @app.get("/health")
 async def health():
@@ -171,8 +228,8 @@ def recent_logs(n: int = 20):
 
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(api_guard)])
-async def chat(req: ChatRequest):
-    """Non-streaming endpoint: full answer in one JSON response."""
+async def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
+    """Non-streaming endpoint: full answer in one JSON response. Protected by get_current_user."""
     t0 = time.perf_counter()
     request_id = now_id()
     mode = req.mode or cfg.router_mode
@@ -212,9 +269,9 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/api/chat/stream", dependencies=[Depends(api_guard)])
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current_user)):
     """SSE endpoint: `meta` event with the routing decision, then `delta` events per
-    token chunk, then a final `done` event with latency/cost totals."""
+    token chunk, then a final `done` event with latency/cost totals. Protected by get_current_user."""
     t0 = time.perf_counter()
     request_id = now_id()
     mode = req.mode or cfg.router_mode

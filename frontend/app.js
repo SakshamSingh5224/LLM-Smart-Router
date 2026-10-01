@@ -1,191 +1,139 @@
-// No build step, no framework: plain fetch() + ReadableStream SSE parsing
-// (EventSource can't send a POST body, which /api/chat/stream needs).
-
-const thread = document.getElementById("thread");
-const form = document.getElementById("composer");
-const input = document.getElementById("query");
-const sendBtn = document.getElementById("send");
-const modeSel = document.getElementById("mode");
-const explainBox = document.getElementById("explain");
-const healthDot = document.getElementById("health");
-
-// Same-origin by default (gateway serves this file itself, e.g. Render single-service).
-// For a split deploy (this frontend on Vercel, gateway on Render), config.js sets
-// window.API_BASE = "https://your-gateway.onrender.com" before this script loads.
-const API_BASE = window.API_BASE || "";
-const API_KEY = window.API_KEY || ""; // set alongside API_BASE in config.js if GATEWAY_API_KEY is enabled
-
-function authHeaders(extra) {
-  return API_KEY ? { ...extra, "X-API-Key": API_KEY } : extra;
+// 1. Authentication Check
+const token = localStorage.getItem('token');
+if (!token && window.location.pathname !== '/login.html') {
+    window.location.href = '/login.html';
 }
 
-function el(tag, cls, text) {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text != null) n.textContent = text;
-  return n;
-}
+// 2. DOM Elements (Safely selected)
+const chatForm = document.getElementById('chat-form');
+const chatInput = document.getElementById('chat-input');
+const chatContainer = document.getElementById('chat-container');
 
-// Render accumulated raw markdown into a bubble as sanitized, highlighted HTML.
-function renderMarkdown(bubble, raw) {
-  const html = marked.parse(raw, { breaks: true, gfm: true });
-  bubble.innerHTML = DOMPurify.sanitize(html);
-  bubble.querySelectorAll("pre code").forEach((block) => {
-    hljs.highlightElement(block);
-  });
-}
+// Only run the chat logic if we are actually on the chat page (not the login page)
+if (chatForm && chatInput && chatContainer) {
+    chatForm.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const query = chatInput.value.trim();
+        if (!query) return;
 
-// Cap re-renders at the browser's paint rate instead of re-parsing markdown on
-// every single token - deltas can arrive many times a second during streaming.
-function scheduleRender(state) {
-  if (state.rafPending) return;
-  state.rafPending = true;
-  requestAnimationFrame(() => {
-    state.rafPending = false;
-    renderMarkdown(state.bubble, state.raw);
-    thread.scrollTop = thread.scrollHeight;
-  });
-}
+        // Display user message
+        appendMessage('user', query);
+        chatInput.value = '';
 
-function addUserMessage(text) {
-  const msg = el("div", "msg user");
-  msg.appendChild(el("div", "bubble", text));
-  thread.appendChild(msg);
-  thread.scrollTop = thread.scrollHeight;
-}
+        // Create a placeholder for the assistant's streaming response
+        const assistantBubble = appendMessage('assistant', '');
+        
+        // Accumulate the full text safely before rendering
+        let fullText = ""; 
 
-function addAssistantMessage() {
-  const msg = el("div", "msg assistant");
-  const meta = el("div", "meta");
-  meta.appendChild(el("span", "tier-badge", "routing…"));
-  const bubble = el("div", "bubble markdown", "");
-  msg.appendChild(meta);
-  msg.appendChild(bubble);
-  thread.appendChild(msg);
-  thread.scrollTop = thread.scrollHeight;
-  return { msg, meta, bubble, raw: "", rafPending: false };
-}
+        try {
+            // Fetch with Authorization Header
+            const response = await fetch('/api/chat/stream', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${localStorage.getItem('token')}`
+                },
+                body: JSON.stringify({ query: query })
+            });
 
-function renderMeta(meta, decision, extra) {
-  meta.innerHTML = "";
-  const badge = el("span", `tier-badge ${decision.tier}`, decision.tier.toUpperCase());
-  meta.appendChild(badge);
-  meta.appendChild(el("span", "", `p(strong)=${decision.p_strong.toFixed(2)}`));
-  meta.appendChild(el("span", "", `mode=${decision.mode}`));
-  if (decision.source === "rules_fallback") {
-    meta.appendChild(el("span", "", "⚠ fallback router"));
-  }
-  if (extra) meta.appendChild(el("span", "", extra));
-  if (explainBox.checked && decision.reasoning) {
-    const r = el("div", "reasoning", decision.reasoning);
-    meta.parentElement.appendChild(r);
-  }
-}
+            // Handle Expired or Invalid Tokens
+            if (response.status === 401) {
+                localStorage.removeItem('token');
+                window.location.href = '/login.html';
+                return;
+            }
 
-async function health() {
-  try {
-    const r = await fetch(`${API_BASE}/health`);
-    const j = await r.json();
-    healthDot.className = `health ${j.status === "ok" ? "ok" : "degraded"}`;
-    healthDot.title = JSON.stringify(j, null, 2);
-  } catch {
-    healthDot.className = "health down";
-    healthDot.title = "gateway unreachable";
-  }
-}
-health();
-setInterval(health, 15000);
+            if (!response.ok) {
+                assistantBubble.innerHTML = `<span style="color:red">Error: ${response.statusText}</span>`;
+                return;
+            }
 
-async function streamChat(query, mode, explain) {
-  const state = addAssistantMessage();
-  const { meta, bubble } = state;
-  const t0 = performance.now();
-  let decision = null;
+            // Parse the Server-Sent Events Stream manually
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder('utf-8');
+            let buffer = "";
 
-  let resp;
-  try {
-    resp = await fetch(`${API_BASE}/api/chat/stream`, {
-      method: "POST",
-      headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ query, mode, explain }),
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                
+                // SSE chunks are separated by double newlines
+                const parts = buffer.split('\n\n');
+                buffer = parts.pop(); // Keep the last incomplete chunk in the buffer
+
+                for (const part of parts) {
+                    let eventType = 'message';
+                    let data = null;
+
+                    // Parse event and data lines
+                    const lines = part.split('\n');
+                    for (const line of lines) {
+                        if (line.startsWith('event: ')) {
+                            eventType = line.substring(7).trim();
+                        } else if (line.startsWith('data: ')) {
+                            const dataString = line.substring(6).trim();
+                            // Safely attempt to parse JSON to prevent crashes on fragmented chunks
+                            try {
+                                data = JSON.parse(dataString);
+                            } catch (parseError) {
+                                console.warn("Skipping unparseable chunk:", dataString);
+                                continue; 
+                            }
+                        }
+                    }
+
+                    // Handle specific events defined in app.py
+                    if (eventType === 'meta' && data) {
+                        console.log("Routed to:", data.decision.tier);
+                    } else if (eventType === 'delta' && data && data.text) {
+                        // Append text chunks to the accumulator and re-render
+                        fullText += data.text;
+                        assistantBubble.innerHTML = escapeHTML(fullText).replace(/\n/g, '<br>');
+                        chatContainer.scrollTop = chatContainer.scrollHeight;
+                    } else if (eventType === 'error' && data) {
+                        assistantBubble.innerHTML += `<br><span style="color:red">Generation Error: ${data.message}</span>`;
+                    } else if (eventType === 'done' && data) {
+                        console.log(`Stream finished. Latency: ${data.total_latency_ms}ms`);
+                    }
+                }
+            }
+        } catch (error) {
+            console.error("Fetch error:", error);
+            assistantBubble.innerHTML += `<br><span style="color:red">Network Error: ${error.message}</span>`;
+        }
     });
-  } catch (e) {
-    bubble.classList.add("error-bubble");
-    bubble.textContent = `Could not reach the gateway: ${e}`;
-    return;
-  }
-  if (!resp.ok || !resp.body) {
-    bubble.classList.add("error-bubble");
-    bubble.textContent = `Gateway error: HTTP ${resp.status}`;
-    return;
-  }
-
-  const reader = resp.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-
-    let idx;
-    while ((idx = buf.indexOf("\n\n")) !== -1) {
-      const raw = buf.slice(0, idx);
-      buf = buf.slice(idx + 2);
-      const lines = raw.split("\n");
-      let event = "message", data = "";
-      for (const line of lines) {
-        if (line.startsWith("event:")) event = line.slice(6).trim();
-        else if (line.startsWith("data:")) data = line.slice(5).trim();
-      }
-      if (!data) continue;
-      let payload;
-      try {
-        payload = JSON.parse(data);
-      } catch {
-        continue;
-      }
-
-      if (event === "meta") {
-        decision = payload.decision;
-        renderMeta(meta, decision);
-      } else if (event === "delta") {
-        state.raw += payload.text;
-        scheduleRender(state);
-      } else if (event === "error") {
-        state.raw += `\n\n**[error: ${payload.message}]**`;
-        renderMarkdown(bubble, state.raw);
-        bubble.classList.add("error-bubble");
-      } else if (event === "done") {
-        renderMarkdown(bubble, state.raw); // force a final render even if a rAF is still pending
-        const ms = Math.round(performance.now() - t0);
-        const cacheNote = payload.cache_hit ? " · from cache" : "";
-        const costNote = payload.est_cost_usd > 0 ? ` · ~$${payload.est_cost_usd.toFixed(5)}` : "";
-        renderMeta(meta, decision, `${ms} ms${cacheNote}${costNote}`);
-      }
-    }
-  }
 }
 
-form.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const query = input.value.trim();
-  if (!query) return;
-  input.value = "";
-  sendBtn.disabled = true;
-  addUserMessage(query);
-  try {
-    await streamChat(query, modeSel.value, explainBox.checked);
-  } finally {
-    sendBtn.disabled = false;
-    input.focus();
-  }
-});
+// Helper function to render messages safely
+function appendMessage(role, text) {
+    if (!chatContainer) return null;
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `message ${role}-message`;
+    msgDiv.innerHTML = text ? escapeHTML(text).replace(/\n/g, '<br>') : '';
+    chatContainer.appendChild(msgDiv);
+    chatContainer.scrollTop = chatContainer.scrollHeight;
+    return msgDiv;
+}
 
-input.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey) {
-    e.preventDefault();
-    form.requestSubmit();
-  }
-});
+// Helper function to prevent XSS attacks
+function escapeHTML(str) {
+    if (!str) return "";
+    return str.replace(/[&<>'"]/g, 
+        tag => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            "'": '&#39;',
+            '"': '&quot;'
+        }[tag] || tag)
+    );
+}
+
+// Optional: Attach this to a logout button in your HTML
+function logout() {
+    localStorage.removeItem('token');
+    window.location.href = '/login.html';
+}
