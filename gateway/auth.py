@@ -5,8 +5,8 @@ from jose import jwt, JWTError
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
-from db.database import get_db
-from db.models import User
+from gateway.db.database import get_db
+from gateway.db.models import User
 
 SECRET_KEY = os.getenv("JWT_SECRET", "super-secret-key-change-in-prod")
 ALGORITHM = "HS256"
