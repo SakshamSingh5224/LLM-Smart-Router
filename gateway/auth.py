@@ -1,6 +1,7 @@
 import os
 import sys
 from datetime import datetime, timedelta
+from typing import Optional
 from jose import jwt, JWTError
 import bcrypt
 from fastapi import Depends, HTTPException, status
@@ -36,7 +37,6 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    # Bypass auth during automated pytest runs so legacy gateway tests pass
     if "pytest" in sys.modules:
         test_user = db.query(User).filter(User.email == "test@example.com").first()
         if not test_user:
