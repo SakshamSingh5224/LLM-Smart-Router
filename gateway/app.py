@@ -26,7 +26,7 @@ from typing import AsyncIterator, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx  # noqa: E402
-from fastapi import FastAPI, HTTPException, Depends, status  # noqa: E402
+from fastapi import FastAPI, HTTPException, Depends  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from fastapi.staticfiles import StaticFiles  # noqa: E402
@@ -64,9 +64,17 @@ jlog = JsonlLogger(cfg.log_path)
 _http = httpx.AsyncClient(timeout=cfg.router_timeout_s)
 
 app = FastAPI(title="LLM Smart Router - Gateway", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=cfg.cors_origins, allow_methods=["*"], allow_headers=["*"])
 
-# Prometheus metrics at GET /metrics (request count, latency histograms, in-progress)
+# Fully permissive CORS middleware to allow Vercel requests without restriction
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Prometheus metrics at GET /metrics
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 # Public-internet gate: require X-API-Key (if GATEWAY_API_KEY is set) + per-key rate limit.
@@ -130,7 +138,7 @@ def seed_default_policies(db: Session):
 
 @app.post("/api/auth/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
-    seed_default_policies(db) # Ensure policies exist[cite: 2]
+    seed_default_policies(db)
     if db.query(User).filter(User.email == user.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
     
@@ -157,21 +165,20 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
 
 
 # --------------------------------------------------------------------------
-# Routing: in-process, or delegate to router_service if ROUTER_SERVICE_URL set
+# Routing Logic
 # --------------------------------------------------------------------------
 async def get_decision(query: str, mode, threshold, explain: bool):
     t0 = time.perf_counter()
     if cfg.router_service_url:
         try:
             r = await _http.post(f"{cfg.router_service_url}/route",
-                                  json={"query": query, "mode": mode, "threshold": threshold, "explain": explain})
+                                 json={"query": query, "mode": mode, "threshold": threshold, "explain": explain})
             r.raise_for_status()
             d = r.json()
             return d, (time.perf_counter() - t0) * 1000
         except (httpx.HTTPError, ValueError) as e:
             log.warning("router_service unreachable (%s) - falling back to in-process rules", e)
             from smartrouter.classifier_router import RulesRouter
-
             d = RulesRouter().route(query, explain=explain)
     else:
         try:
@@ -229,7 +236,6 @@ def recent_logs(n: int = 20):
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(api_guard)])
 async def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
-    """Non-streaming endpoint: full answer in one JSON response. Protected by get_current_user."""
     t0 = time.perf_counter()
     request_id = now_id()
     mode = req.mode or cfg.router_mode
@@ -270,8 +276,6 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user))
 
 @app.post("/api/chat/stream", dependencies=[Depends(api_guard)])
 async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current_user)):
-    """SSE endpoint: `meta` event with the routing decision, then `delta` events per
-    token chunk, then a final `done` event with latency/cost totals. Protected by get_current_user."""
     t0 = time.perf_counter()
     request_id = now_id()
     mode = req.mode or cfg.router_mode
@@ -288,7 +292,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         if cache and req.use_cache:
             hit = cache.get(req.query, mode)
             if hit:
-                for i in range(0, len(hit.answer), 40):  # replay cached text in small chunks
+                for i in range(0, len(hit.answer), 40):
                     yield sse("delta", {"text": hit.answer[i:i + 40]})
                     await asyncio.sleep(0)
                 total = _log_and_finish(request_id, req.query, decision, True, router_ms, 0.0, None, t0, 0)
@@ -326,7 +330,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-# Serve the frontend (built with no framework, so nothing to compile) if present.
+# Serve the static frontend if present
 _frontend_dir = Path(__file__).resolve().parents[1] / "frontend"
 if _frontend_dir.exists():
     app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
