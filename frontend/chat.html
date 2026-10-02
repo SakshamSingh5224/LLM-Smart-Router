@@ -24,8 +24,10 @@
             <option value="conservative">conservative (safest)</option>
           </select>
         </label>
-        <label class="checkbox"><input type="checkbox" id="explain" /> explain routing</label>
-        <span id="health" class="health" title="gateway / router status">●</span>
+        <label class="checkbox">
+          <input type="checkbox" id="explain" checked /> explain routing
+        </label>
+        <span id="health" class="health ok" title="gateway / router status">●</span>
       </div>
     </header>
 
@@ -35,8 +37,7 @@
       <textarea id="query" rows="2" placeholder="Ask anything… (Shift+Enter for a new line)"></textarea>
       <button id="send" type="submit">Send</button>
     </form>
-    <p class="hint">Simple prompts are answered by the local free model; complex ones are escalated to the strong
-      free-tier model. This demo runs entirely on free infrastructure — no billing is involved.</p>
+    <p class="hint">Simple prompts are answered by the local free model; complex ones are escalated to the strong free-tier model. This demo runs entirely on free infrastructure — no billing is involved.</p>
   </div>
   <script src="config.js"></script>
   <script src="app.js"></script>
