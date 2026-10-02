@@ -4,10 +4,10 @@ if (!token && window.location.pathname !== '/login.html') {
     window.location.href = '/login.html';
 }
 
-// 2. DOM Elements (Safely selected)
-const chatForm = document.getElementById('chat-form');
-const chatInput = document.getElementById('chat-input');
-const chatContainer = document.getElementById('chat-container');
+// 2. DOM Elements (Updated to match index.html IDs)
+const chatForm = document.getElementById('composer');
+const chatInput = document.getElementById('query');
+const chatContainer = document.getElementById('thread');
 
 // Only run the chat logic if we are actually on the chat page (not the login page)
 if (chatForm && chatInput && chatContainer) {
