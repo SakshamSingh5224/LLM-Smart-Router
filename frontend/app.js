@@ -1,140 +1,193 @@
-// Configure marked.js to use highlight.js for rendering code blocks
-marked.setOptions({
-    highlight: function(code, lang) {
-        if (lang && hljs.getLanguage(lang)) {
-            return hljs.highlight(code, { language: lang }).value;
+// frontend/app.js
+
+// Ensure BACKEND_URL is available from config.js, or use a default
+const API_BASE = typeof BACKEND_URL !== 'undefined' ? BACKEND_URL : "https://llm-gateway-62xo.onrender.com";
+
+document.addEventListener("DOMContentLoaded", () => {
+    // 1. Authentication Check
+    const token = localStorage.getItem('token');
+    if (!token) {
+        window.location.href = '/index.html';
+        return;
+    }
+
+    // 2. DOM Elements
+    const form = document.getElementById('composer');
+    const queryInput = document.getElementById('query');
+    const sendBtn = document.getElementById('send');
+    const thread = document.getElementById('thread');
+    const healthIndicator = document.getElementById('health');
+    const modeSelect = document.getElementById('mode');
+    const explainCheckbox = document.getElementById('explain');
+
+    // 3. Health Check
+    async function checkHealth() {
+        try {
+            const res = await fetch(`${API_BASE}/health`);
+            const data = await res.json();
+            if (data.status === 'ok') {
+                healthIndicator.className = 'health ok';
+                healthIndicator.title = "Gateway / Router Status: OK";
+            } else {
+                healthIndicator.className = 'health degraded';
+                healthIndicator.title = "Gateway / Router Status: Degraded";
+            }
+        } catch (e) {
+            healthIndicator.className = 'health down';
+            healthIndicator.title = "Gateway / Router Status: Down";
         }
-        return hljs.highlightAuto(code).value;
-    },
-    breaks: true // Enables GitHub-flavored markdown line breaks
-});
+    }
+    checkHealth();
 
-// 1. Authentication Check
-const token = localStorage.getItem('token');
-// Redirect to the new login page (index.html or /) if unauthenticated
-if (!token && window.location.pathname !== '/' && window.location.pathname !== '/index.html') {
-    window.location.replace('/');
-}
+    // 4. Input Handling (Shift+Enter for newline, Enter to send)
+    queryInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            if (!sendBtn.disabled) {
+                form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+            }
+        }
+    });
 
-// 2. DOM Elements
-const chatForm = document.getElementById('composer');
-const chatInput = document.getElementById('query');
-const chatContainer = document.getElementById('thread');
-
-// Only run the chat logic if we are actually on the chat page
-if (chatForm && chatInput && chatContainer) {
-    chatForm.addEventListener('submit', async (e) => {
+    // 5. Submit Message to Backend
+    form.addEventListener('submit', async (e) => {
         e.preventDefault();
-        const query = chatInput.value.trim();
-        if (!query) return;
+        const text = queryInput.value.trim();
+        if (!text) return;
 
-        // Display user message as plain text (false = no markdown parsing)
-        appendMessage('user', query, false);
-        chatInput.value = '';
+        const currentMode = modeSelect.value;
+        const wantsExplanation = explainCheckbox.checked;
 
-        // Create a placeholder for the assistant's streaming response
-        const assistantBubble = appendMessage('assistant', '', true);
-        
-        // Accumulate the full text safely before rendering
-        let fullText = ""; 
+        // Update UI
+        appendUserMessage(text);
+        queryInput.value = '';
+        sendBtn.disabled = true;
+        queryInput.disabled = true;
 
         try {
-            const response = await fetch('/api/chat/stream', {
+            const response = await fetch(`${API_BASE}/api/chat`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${localStorage.getItem('token')}`
+                    'Authorization': `Bearer ${token}`
                 },
-                body: JSON.stringify({ query: query })
+                body: JSON.stringify({
+                    query: text,
+                    mode: currentMode,
+                    explain: wantsExplanation,
+                    use_cache: true
+                })
             });
 
+            // Handle unauthorized access (token expired or invalid)
             if (response.status === 401) {
                 localStorage.removeItem('token');
-                window.location.replace('/');
+                window.location.href = '/index.html';
                 return;
             }
 
             if (!response.ok) {
-                assistantBubble.innerHTML = `<span style="color:red">Error: ${response.statusText}</span>`;
-                return;
+                const errData = await response.json();
+                throw new Error(errData.detail || 'Server error occurred');
             }
 
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder('utf-8');
-            let buffer = "";
+            const data = await response.json();
+            appendAssistantMessage(data, currentMode);
 
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-
-                buffer += decoder.decode(value, { stream: true });
-                
-                const parts = buffer.split('\n\n');
-                buffer = parts.pop(); 
-
-                for (const part of parts) {
-                    let eventType = 'message';
-                    let data = null;
-
-                    const lines = part.split('\n');
-                    for (const line of lines) {
-                        if (line.startsWith('event: ')) {
-                            eventType = line.substring(7).trim();
-                        } else if (line.startsWith('data: ')) {
-                            const dataString = line.substring(6).trim();
-                            try {
-                                data = JSON.parse(dataString);
-                            } catch (parseError) {
-                                continue; 
-                            }
-                        }
-                    }
-
-                    if (eventType === 'meta' && data) {
-                        console.log("Routed to:", data.decision.tier);
-                    } else if (eventType === 'delta' && data && data.text) {
-                        fullText += data.text;
-                        
-                        // Parse Markdown to HTML, then sanitize it safely
-                        const rawHTML = marked.parse(fullText);
-                        assistantBubble.innerHTML = DOMPurify.sanitize(rawHTML);
-                        
-                        chatContainer.scrollTop = chatContainer.scrollHeight;
-                    } else if (eventType === 'error' && data) {
-                        assistantBubble.innerHTML += `<br><span style="color:red">Generation Error: ${data.message}</span>`;
-                    } else if (eventType === 'done' && data) {
-                        console.log(`Stream finished. Latency: ${data.total_latency_ms}ms`);
-                    }
-                }
-            }
-        } catch (error) {
-            console.error("Fetch error:", error);
-            assistantBubble.innerHTML += `<br><span style="color:red">Network Error: ${error.message}</span>`;
+        } catch (err) {
+            console.error("Chat error:", err);
+            appendErrorMessage(err.message);
+        } finally {
+            sendBtn.disabled = false;
+            queryInput.disabled = false;
+            queryInput.focus();
         }
     });
-}
 
-// Helper function to render messages safely supporting Markdown
-function appendMessage(role, text, isMarkdown = false) {
-    if (!chatContainer) return null;
-    const msgDiv = document.createElement('div');
-    msgDiv.className = `message ${role}-message`;
-    
-    if (text) {
-        if (isMarkdown) {
-            msgDiv.innerHTML = DOMPurify.sanitize(marked.parse(text));
-        } else {
-            msgDiv.textContent = text; 
-        }
+    // 6. UI Rendering Functions
+    function appendUserMessage(text) {
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'msg user';
+        
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.textContent = text; // textContent prevents XSS
+        
+        msgDiv.appendChild(bubble);
+        thread.appendChild(msgDiv);
+        thread.scrollTop = thread.scrollHeight;
     }
-    
-    chatContainer.appendChild(msgDiv);
-    chatContainer.scrollTop = chatContainer.scrollHeight;
-    return msgDiv;
-}
 
-// Optional: Attach this to a logout button in your HTML
-function logout() {
-    localStorage.removeItem('token');
-    window.location.replace('/');
-}
+    function appendAssistantMessage(data, currentMode) {
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'msg assistant';
+
+        // Extract backend keys based on gateway/app.py ChatResponse structure
+        const decision = data.decision || {};
+        const routeDecision = decision.tier || 'LOW';
+        const pStrong = decision.p_strong ? decision.p_strong.toFixed(3) : '0.000';
+        const latency = data.router_latency_ms || 0;
+        const reasoning = decision.reasoning || '';
+        const answerText = data.answer || '';
+
+        // Build Metadata Header
+        const badgeClass = routeDecision.toLowerCase() === 'high' ? 'high' : 'low';
+        const metaHTML = `
+            <div class="meta">
+                <span class="tier-badge ${badgeClass}">${routeDecision.toUpperCase()}</span>
+                <span>p(strong)=${pStrong} mode=${currentMode} ${latency} ms</span>
+            </div>
+        `;
+        msgDiv.insertAdjacentHTML('beforeend', metaHTML);
+
+        // Build Message Bubble
+        const bubbleDiv = document.createElement('div');
+        bubbleDiv.className = 'bubble markdown';
+        
+        if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
+            // Configure marked for GitHub Flavored Markdown
+            marked.setOptions({
+                gfm: true,
+                breaks: true
+            });
+            bubbleDiv.innerHTML = DOMPurify.sanitize(marked.parse(answerText));
+        } else {
+            bubbleDiv.innerText = answerText;
+        }
+        msgDiv.appendChild(bubbleDiv);
+
+        // Build Routing Explanation
+        if (explainCheckbox.checked && reasoning) {
+            const reasoningDiv = document.createElement('div');
+            reasoningDiv.className = 'reasoning';
+            reasoningDiv.innerHTML = reasoning.replace(/\n/g, '<br>');
+            msgDiv.appendChild(reasoningDiv);
+        }
+
+        thread.appendChild(msgDiv);
+        
+        // Trigger syntax highlighting
+        if (typeof hljs !== 'undefined') {
+            msgDiv.querySelectorAll('pre code').forEach((block) => {
+                hljs.highlightElement(block);
+            });
+        }
+
+        thread.scrollTop = thread.scrollHeight;
+    }
+
+    function appendErrorMessage(errorMsg) {
+        const msgDiv = document.createElement('div');
+        msgDiv.className = 'msg assistant';
+        
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble error-bubble';
+        bubble.style.borderColor = 'var(--error)';
+        bubble.style.color = 'var(--error)';
+        bubble.textContent = 'Error: ' + errorMsg;
+        
+        msgDiv.appendChild(bubble);
+        thread.appendChild(msgDiv);
+        thread.scrollTop = thread.scrollHeight;
+    }
+});
