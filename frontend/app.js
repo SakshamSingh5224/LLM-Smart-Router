@@ -11,8 +11,9 @@ marked.setOptions({
 
 // 1. Authentication Check
 const token = localStorage.getItem('token');
-if (!token && window.location.pathname !== '/login.html') {
-    window.location.href = '/login.html';
+// Redirect to the new login page (index.html or /) if unauthenticated
+if (!token && window.location.pathname !== '/' && window.location.pathname !== '/index.html') {
+    window.location.replace('/');
 }
 
 // 2. DOM Elements
@@ -49,7 +50,7 @@ if (chatForm && chatInput && chatContainer) {
 
             if (response.status === 401) {
                 localStorage.removeItem('token');
-                window.location.href = '/login.html';
+                window.location.replace('/');
                 return;
             }
 
@@ -84,7 +85,6 @@ if (chatForm && chatInput && chatContainer) {
                             try {
                                 data = JSON.parse(dataString);
                             } catch (parseError) {
-                                console.warn("Skipping unparseable chunk:", dataString);
                                 continue; 
                             }
                         }
@@ -124,7 +124,6 @@ function appendMessage(role, text, isMarkdown = false) {
         if (isMarkdown) {
             msgDiv.innerHTML = DOMPurify.sanitize(marked.parse(text));
         } else {
-            // Native textContent assignment prevents XSS for plain text user inputs
             msgDiv.textContent = text; 
         }
     }
@@ -137,5 +136,5 @@ function appendMessage(role, text, isMarkdown = false) {
 // Optional: Attach this to a logout button in your HTML
 function logout() {
     localStorage.removeItem('token');
-    window.location.href = '/login.html';
+    window.location.replace('/');
 }
