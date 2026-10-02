@@ -1,33 +1,43 @@
+// Configure marked.js to use highlight.js for rendering code blocks
+marked.setOptions({
+    highlight: function(code, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+            return hljs.highlight(code, { language: lang }).value;
+        }
+        return hljs.highlightAuto(code).value;
+    },
+    breaks: true // Enables GitHub-flavored markdown line breaks
+});
+
 // 1. Authentication Check
 const token = localStorage.getItem('token');
 if (!token && window.location.pathname !== '/login.html') {
     window.location.href = '/login.html';
 }
 
-// 2. DOM Elements (Updated to match index.html IDs)
+// 2. DOM Elements
 const chatForm = document.getElementById('composer');
 const chatInput = document.getElementById('query');
 const chatContainer = document.getElementById('thread');
 
-// Only run the chat logic if we are actually on the chat page (not the login page)
+// Only run the chat logic if we are actually on the chat page
 if (chatForm && chatInput && chatContainer) {
     chatForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         const query = chatInput.value.trim();
         if (!query) return;
 
-        // Display user message
-        appendMessage('user', query);
+        // Display user message as plain text (false = no markdown parsing)
+        appendMessage('user', query, false);
         chatInput.value = '';
 
         // Create a placeholder for the assistant's streaming response
-        const assistantBubble = appendMessage('assistant', '');
+        const assistantBubble = appendMessage('assistant', '', true);
         
         // Accumulate the full text safely before rendering
         let fullText = ""; 
 
         try {
-            // Fetch with Authorization Header
             const response = await fetch('/api/chat/stream', {
                 method: 'POST',
                 headers: {
@@ -37,7 +47,6 @@ if (chatForm && chatInput && chatContainer) {
                 body: JSON.stringify({ query: query })
             });
 
-            // Handle Expired or Invalid Tokens
             if (response.status === 401) {
                 localStorage.removeItem('token');
                 window.location.href = '/login.html';
@@ -49,7 +58,6 @@ if (chatForm && chatInput && chatContainer) {
                 return;
             }
 
-            // Parse the Server-Sent Events Stream manually
             const reader = response.body.getReader();
             const decoder = new TextDecoder('utf-8');
             let buffer = "";
@@ -60,22 +68,19 @@ if (chatForm && chatInput && chatContainer) {
 
                 buffer += decoder.decode(value, { stream: true });
                 
-                // SSE chunks are separated by double newlines
                 const parts = buffer.split('\n\n');
-                buffer = parts.pop(); // Keep the last incomplete chunk in the buffer
+                buffer = parts.pop(); 
 
                 for (const part of parts) {
                     let eventType = 'message';
                     let data = null;
 
-                    // Parse event and data lines
                     const lines = part.split('\n');
                     for (const line of lines) {
                         if (line.startsWith('event: ')) {
                             eventType = line.substring(7).trim();
                         } else if (line.startsWith('data: ')) {
                             const dataString = line.substring(6).trim();
-                            // Safely attempt to parse JSON to prevent crashes on fragmented chunks
                             try {
                                 data = JSON.parse(dataString);
                             } catch (parseError) {
@@ -85,13 +90,15 @@ if (chatForm && chatInput && chatContainer) {
                         }
                     }
 
-                    // Handle specific events defined in app.py
                     if (eventType === 'meta' && data) {
                         console.log("Routed to:", data.decision.tier);
                     } else if (eventType === 'delta' && data && data.text) {
-                        // Append text chunks to the accumulator and re-render
                         fullText += data.text;
-                        assistantBubble.innerHTML = escapeHTML(fullText).replace(/\n/g, '<br>');
+                        
+                        // Parse Markdown to HTML, then sanitize it safely
+                        const rawHTML = marked.parse(fullText);
+                        assistantBubble.innerHTML = DOMPurify.sanitize(rawHTML);
+                        
                         chatContainer.scrollTop = chatContainer.scrollHeight;
                     } else if (eventType === 'error' && data) {
                         assistantBubble.innerHTML += `<br><span style="color:red">Generation Error: ${data.message}</span>`;
@@ -107,29 +114,24 @@ if (chatForm && chatInput && chatContainer) {
     });
 }
 
-// Helper function to render messages safely
-function appendMessage(role, text) {
+// Helper function to render messages safely supporting Markdown
+function appendMessage(role, text, isMarkdown = false) {
     if (!chatContainer) return null;
     const msgDiv = document.createElement('div');
     msgDiv.className = `message ${role}-message`;
-    msgDiv.innerHTML = text ? escapeHTML(text).replace(/\n/g, '<br>') : '';
+    
+    if (text) {
+        if (isMarkdown) {
+            msgDiv.innerHTML = DOMPurify.sanitize(marked.parse(text));
+        } else {
+            // Native textContent assignment prevents XSS for plain text user inputs
+            msgDiv.textContent = text; 
+        }
+    }
+    
     chatContainer.appendChild(msgDiv);
     chatContainer.scrollTop = chatContainer.scrollHeight;
     return msgDiv;
-}
-
-// Helper function to prevent XSS attacks
-function escapeHTML(str) {
-    if (!str) return "";
-    return str.replace(/[&<>'"]/g, 
-        tag => ({
-            '&': '&amp;',
-            '<': '&lt;',
-            '>': '&gt;',
-            "'": '&#39;',
-            '"': '&quot;'
-        }[tag] || tag)
-    );
 }
 
 // Optional: Attach this to a logout button in your HTML
