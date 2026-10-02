@@ -59,7 +59,8 @@
                 if (res.ok) {
                     if (endpoint.includes('login')) {
                         localStorage.setItem('token', data.access_token);
-                        window.location.href = '/index.html';
+                        // FIXED: Redirects to chat.html instead of looping back to index.html
+                        window.location.href = '/chat.html'; 
                     } else {
                         msgLabel.style.color = "green";
                         msgLabel.innerText = "Registered successfully! You can now log in.";
