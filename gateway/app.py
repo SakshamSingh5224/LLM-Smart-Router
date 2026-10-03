@@ -1,18 +1,4 @@
-"""Backend Gateway (Phase 3 & MVP 2 Phase 2A).
-
-Wires up the full request path from user input to final response:
-  1. accept a query from the frontend
-  2. get a tier decision (in-process router, or the router_service over HTTP
-     if ROUTER_SERVICE_URL is set)
-  3. forward the query to the selected model tier (low-cost or high-cost)
-  4. stream the response back to the frontend over Server-Sent Events
-  5. log routing decisions, latencies, and estimated cost
-  6. serve the static frontend
-  7. Provide JWT authentication and session management
-
-Run:
-    uvicorn gateway.app:app --host 0.0.0.0 --port 8000
-"""
+"""Backend Gateway (Phase 3 & MVP 2 Phase 2A/2B)."""
 from __future__ import annotations
 
 import asyncio
@@ -25,29 +11,28 @@ from typing import AsyncIterator, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import httpx  # noqa: E402
-from fastapi import FastAPI, HTTPException, Depends  # noqa: E402
-from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import StreamingResponse  # noqa: E402
-from fastapi.staticfiles import StaticFiles  # noqa: E402
-from pydantic import BaseModel, Field  # noqa: E402
-from prometheus_fastapi_instrumentator import Instrumentator  # noqa: E402
-from sqlalchemy.orm import Session  # noqa: E402
+import httpx
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from prometheus_fastapi_instrumentator import Instrumentator
+from sqlalchemy.orm import Session
 
-from gateway.cache import ResponseCache  # noqa: E402
-from gateway.logging_utils import JsonlLogger, RequestLog, now_id  # noqa: E402
-from gateway.router_loader import load_router  # noqa: E402
-from gateway.security import make_guard  # noqa: E402
-from gateway.settings import load_gateway_settings  # noqa: E402
-from gateway.tier_clients import StreamChunk, collect_stream, make_high_stream_client, make_low_stream_client  # noqa: E402
-from smartrouter.labels import HIGH, LOW  # noqa: E402
+from gateway.cache import ResponseCache
+from gateway.logging_utils import JsonlLogger, RequestLog, now_id
+from gateway.router_loader import load_router
+from gateway.security import make_guard
+from gateway.settings import load_gateway_settings
+from gateway.tier_clients import StreamChunk, collect_stream, make_high_stream_client, make_low_stream_client
+from smartrouter.labels import HIGH, LOW
 
-# MVP 2 DB & Auth Imports
-from gateway.db.database import engine, Base, get_db
+from gateway.db.database import engine, Base, get_db, SessionLocal
 from gateway.db.models import User, Policy, UserPolicy
 from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user
+from gateway.policy import PolicyEngine
 
-# Initialize database tables
 Base.metadata.create_all(bind=engine)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -65,7 +50,6 @@ _http = httpx.AsyncClient(timeout=cfg.router_timeout_s)
 
 app = FastAPI(title="LLM Smart Router - Gateway", version="1.0.0")
 
-# Fully permissive CORS middleware to allow Vercel requests without restriction
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -74,14 +58,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Prometheus metrics at GET /metrics
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
-
-# Public-internet gate: require X-API-Key (if GATEWAY_API_KEY is set) + per-key rate limit.
 api_guard = make_guard(cfg.api_key or None, cfg.rate_limit_per_min)
 
 SYSTEM_PROMPT = "You are a helpful, concise assistant."
-
 
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=20000)
@@ -111,8 +91,8 @@ class ChatResponse(BaseModel):
     total_latency_ms: float
     tokens_est: int
     est_cost_usd: float
+    downgraded: bool = False
 
-# Auth Request Models
 class UserCreate(BaseModel):
     email: str
     password: str
@@ -122,9 +102,7 @@ class UserLogin(BaseModel):
     password: str
 
 
-# --------------------------------------------------------------------------
-# Authentication & Identity Endpoints
-# --------------------------------------------------------------------------
+# --- Auth Endpoints ---
 def seed_default_policies(db: Session):
     policies = [
         {"name": "free", "query_threshold": 50, "action_on_exhaustion": "downgrade_to_low"},
@@ -151,7 +129,6 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
     free_policy = db.query(Policy).filter(Policy.name == "free").first()
     db.add(UserPolicy(user_id=new_user.id, policy_id=free_policy.id))
     db.commit()
-    
     return {"message": "User created successfully"}
 
 @app.post("/api/auth/login")
@@ -164,9 +141,7 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-# --------------------------------------------------------------------------
-# Routing Logic
-# --------------------------------------------------------------------------
+# --- Routing & Logging ---
 async def get_decision(query: str, mode, threshold, explain: bool):
     t0 = time.perf_counter()
     if cfg.router_service_url:
@@ -189,15 +164,12 @@ async def get_decision(query: str, mode, threshold, explain: bool):
             "mode": d.mode, "source": d.source, "reasoning": d.reasoning,
             "signals": getattr(d, "signals", [])}, (time.perf_counter() - t0) * 1000
 
-
 def tier_client(tier: str):
     return low_client if tier == LOW else high_client
-
 
 def cost_of(tier: str, tokens_est: int) -> float:
     rate = cfg.cost_per_1k_low if tier == LOW else cfg.cost_per_1k_high
     return round(rate * tokens_est / 1000.0, 6)
-
 
 def _log_and_finish(request_id, query, decision, cache_hit, router_ms, gen_ms, ttft_ms, t_start, tokens_est, err=None):
     total_ms = (time.perf_counter() - t_start) * 1000
@@ -212,99 +184,104 @@ def _log_and_finish(request_id, query, decision, cache_hit, router_ms, gen_ms, t
     return total_ms
 
 
-# --------------------------------------------------------------------------
-# Core Endpoints
-# --------------------------------------------------------------------------
+# --- Core Endpoints ---
 @app.get("/health")
 async def health():
     ok = router_status["status"] == "ok" or cfg.router_service_url != ""
-    return {"status": "ok" if ok else "degraded", "router": router_status,
-            "router_service_url": cfg.router_service_url or None, "cache": cache.stats() if cache else None}
-
-
-@app.get("/modes")
-def modes():
-    if cfg.router_service_url:
-        return {"note": "modes are served by the router_service", "url": f"{cfg.router_service_url}/modes"}
-    return {"default_mode": getattr(router, "default_mode", cfg.router_mode), "modes": getattr(router, "modes", {})}
-
-
-@app.get("/logs/recent")
-def recent_logs(n: int = 20):
-    return jlog.tail(min(n, 200))
-
+    return {"status": "ok" if ok else "degraded"}
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(api_guard)])
-async def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
+async def chat(req: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     t0 = time.perf_counter()
     request_id = now_id()
     mode = req.mode or cfg.router_mode
 
-    decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
-    tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
+    # 1. Policy Evaluation
+    policy_engine = PolicyEngine(db)
+    policy_decision = policy_engine.evaluate(current_user.id)
+    
+    if policy_decision.action == "block":
+        raise HTTPException(status_code=402, detail=policy_decision.reason)
 
+    # 2. Routing (Bypass if downgraded)
+    if policy_decision.is_downgraded:
+        decision = {"tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0, 
+                    "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason}
+        router_ms = 0.0
+        tier = LOW
+    else:
+        decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
+        tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
+
+    # 3. Cache & Generation
     cache_hit = False
     if cache and req.use_cache:
         hit = cache.get(req.query, mode)
         if hit:
-            cache_hit = True
             total = _log_and_finish(request_id, req.query, decision, True, router_ms, 0.0, None, t0, 0)
             return ChatResponse(request_id=request_id, answer=hit.answer,
                                 decision=RouteDecisionOut(**{k: decision[k] for k in RouteDecisionOut.model_fields}),
                                 cache_hit=True, router_latency_ms=round(router_ms, 1), generation_latency_ms=0.0,
-                                total_latency_ms=round(total, 1), tokens_est=0, est_cost_usd=0.0)
+                                total_latency_ms=round(total, 1), tokens_est=0, est_cost_usd=0.0,
+                                downgraded=policy_decision.is_downgraded)
 
     client = tier_client(tier)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": req.query}]
-    max_tokens = req.max_tokens or cfg.max_tokens
-    stats = await collect_stream(client.stream_chat(messages, max_tokens=max_tokens))
+    stats = await collect_stream(client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens))
+    
     if stats.error:
-        total = _log_and_finish(request_id, req.query, decision, False, router_ms, stats.latency_ms, None, t0, 0, stats.error)
+        _log_and_finish(request_id, req.query, decision, False, router_ms, stats.latency_ms, None, t0, 0, stats.error)
         raise HTTPException(status_code=502, detail=f"{tier} tier error: {stats.error}")
 
+    # 4. Record Usage and Return
+    cost = cost_of(tier, stats.tokens_est)
+    policy_engine.record_usage(current_user.id, tier, stats.tokens_est, cost, policy_decision.is_downgraded)
+    
     if cache and req.use_cache:
         cache.put(req.query, mode, stats.text, tier, decision["p_strong"])
-    total = _log_and_finish(request_id, req.query, decision, False, router_ms, stats.latency_ms, stats.ttft_ms,
-                            t0, stats.tokens_est)
+        
+    total = _log_and_finish(request_id, req.query, decision, False, router_ms, stats.latency_ms, stats.ttft_ms, t0, stats.tokens_est)
     return ChatResponse(
         request_id=request_id, answer=stats.text,
-        decision=RouteDecisionOut(**{k: decision[k] for k in RouteDecisionOut.model_fields}),
+        decision=RouteDecisionOut(**{k: decision.get(k, 0) for k in RouteDecisionOut.model_fields}),
         cache_hit=False, router_latency_ms=round(router_ms, 1), generation_latency_ms=round(stats.latency_ms, 1),
-        total_latency_ms=round(total, 1), tokens_est=stats.tokens_est, est_cost_usd=cost_of(tier, stats.tokens_est),
+        total_latency_ms=round(total, 1), tokens_est=stats.tokens_est, est_cost_usd=cost,
+        downgraded=policy_decision.is_downgraded
     )
 
-
 @app.post("/api/chat/stream", dependencies=[Depends(api_guard)])
-async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current_user)):
+async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     t0 = time.perf_counter()
     request_id = now_id()
     mode = req.mode or cfg.router_mode
-    decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
-    tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
+    
+    # 1. Policy Evaluation
+    policy_engine = PolicyEngine(db)
+    policy_decision = policy_engine.evaluate(current_user.id)
+    if policy_decision.action == "block":
+        raise HTTPException(status_code=402, detail=policy_decision.reason)
+
+    if policy_decision.is_downgraded:
+        decision = {"tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0, 
+                    "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason}
+        router_ms = 0.0
+        tier = LOW
+    else:
+        decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
+        tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
 
     async def gen() -> AsyncIterator[bytes]:
         def sse(event: str, data: dict) -> bytes:
             return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
         yield sse("meta", {"request_id": request_id, "decision": decision, "cache_hit": False,
-                           "router_latency_ms": round(router_ms, 1)})
-
-        if cache and req.use_cache:
-            hit = cache.get(req.query, mode)
-            if hit:
-                for i in range(0, len(hit.answer), 40):
-                    yield sse("delta", {"text": hit.answer[i:i + 40]})
-                    await asyncio.sleep(0)
-                total = _log_and_finish(request_id, req.query, decision, True, router_ms, 0.0, None, t0, 0)
-                yield sse("done", {"total_latency_ms": round(total, 1), "cache_hit": True, "tokens_est": 0,
-                                   "est_cost_usd": 0.0})
-                return
+                           "router_latency_ms": round(router_ms, 1), "downgraded": policy_decision.is_downgraded})
 
         client = tier_client(tier)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": req.query}]
-        max_tokens = req.max_tokens or cfg.max_tokens
         text_parts, ttft_ms, gen_t0, err = [], None, time.perf_counter(), None
-        async for chunk in client.stream_chat(messages, max_tokens=max_tokens):
+        
+        async for chunk in client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens):
             if isinstance(chunk, StreamChunk) and chunk.error:
                 err = chunk.error
                 yield sse("error", {"message": err})
@@ -316,21 +293,21 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                 yield sse("delta", {"text": chunk.delta})
             if chunk.done:
                 break
+                
         gen_ms = (time.perf_counter() - gen_t0) * 1000
         full_text = "".join(text_parts)
         tokens_est = max(1, len(full_text) // 4) if full_text else 0
+        cost = cost_of(tier, tokens_est)
 
-        if not err and cache and req.use_cache and full_text:
-            cache.put(req.query, mode, full_text, tier, decision["p_strong"])
+        # Record usage via a fresh session context so it persists after StreamingResponse closes the main request
+        if not err:
+            with SessionLocal() as record_db:
+                engine = PolicyEngine(record_db)
+                engine.record_usage(current_user.id, tier, tokens_est, cost, policy_decision.is_downgraded)
+
         total = _log_and_finish(request_id, req.query, decision, False, router_ms, gen_ms, ttft_ms, t0, tokens_est, err)
         yield sse("done", {"total_latency_ms": round(total, 1), "cache_hit": False, "tokens_est": tokens_est,
-                           "est_cost_usd": cost_of(tier, tokens_est), "ttft_ms": round(ttft_ms, 1) if ttft_ms else None})
+                           "est_cost_usd": cost, "ttft_ms": round(ttft_ms, 1) if ttft_ms else None})
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-# Serve the static frontend if present
-_frontend_dir = Path(__file__).resolve().parents[1] / "frontend"
-if _frontend_dir.exists():
-    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
