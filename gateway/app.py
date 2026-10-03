@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from prometheus_fastapi_instrumentator import Instrumentator
 from sqlalchemy.orm import Session
-
+from datetime import datetime, timezone
 from gateway.cache import ResponseCache
 from gateway.logging_utils import JsonlLogger, RequestLog, now_id
 from gateway.router_loader import load_router
@@ -30,8 +30,8 @@ from smartrouter.labels import HIGH, LOW
 
 from gateway.db import database as db_module
 from gateway.db.database import get_db
-from gateway.db.models import User, Policy, UserPolicy
-from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user
+from gateway.db.models import User, Policy, UserPolicy, RefreshToken
+from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user, create_refresh_token, hash_token
 from gateway.policy import PolicyEngine
 
 db_module.Base.metadata.create_all(bind=db_module.engine)
@@ -101,10 +101,22 @@ class UserCreate(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
-
+    
+class RefreshRequest(BaseModel):
+    refresh_token: str
 
 # --- Auth Endpoints ---
+_seeded_engines: set[int] = set()
+
 def seed_default_policies(db: Session):
+    # Keyed by the engine's identity (not a bare process-wide flag) so each
+    # distinct database - the one real prod engine, and each test file's own
+    # throwaway in-memory engine - gets seeded exactly once on its own first
+    # call, instead of re-running 3 SELECTs + a commit on every single
+    # /api/auth/register request forever after the policies already exist.
+    engine_key = id(db.get_bind())
+    if engine_key in _seeded_engines:
+        return
     policies = [
         {"name": "free", "query_threshold": 50, "action_on_exhaustion": "downgrade_to_low"},
         {"name": "trusted", "query_threshold": 1000, "action_on_exhaustion": "downgrade_to_low"},
@@ -114,6 +126,7 @@ def seed_default_policies(db: Session):
         if not db.query(Policy).filter(Policy.name == p["name"]).first():
             db.add(Policy(**p))
     db.commit()
+    _seeded_engines.add(engine_key)
 
 @app.post("/api/auth/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -139,8 +152,40 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     
     access_token = create_access_token(data={"sub": str(db_user.id)})
-    return {"access_token": access_token, "token_type": "bearer"}
+    refresh_token = create_refresh_token(db, db_user.id)
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+@app.post("/api/auth/refresh")
+def refresh_access_token(req: RefreshRequest, db: Session = Depends(get_db)):
+    invalid = HTTPException(status_code=401, detail="Invalid or expired refresh token")
 
+    token_hash = hash_token(req.refresh_token)
+    rt = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
+    if not rt:
+        raise invalid
+    if rt.revoked_at is not None:
+        raise invalid
+    expires_at = rt.expires_at
+    if expires_at is not None:
+        # SQLite returns this naive; Postgres/Neon returns it tz-aware. Normalize
+        # before comparing so this doesn't crash only in production.
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            raise invalid
+
+    access_token = create_access_token(data={"sub": str(rt.user_id)})
+    return {"access_token": access_token, "token_type": "bearer"}
+@app.post("/api/auth/logout")
+def logout(req: RefreshRequest, db: Session = Depends(get_db)):
+    # Idempotent and silent either way (unknown token, already-revoked token, or a
+    # freshly-revoked one all respond identically) so this endpoint never leaks
+    # whether a given refresh token string is/was valid.
+    token_hash = hash_token(req.refresh_token)
+    rt = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
+    if rt and rt.revoked_at is None:
+        rt.revoked_at = datetime.now(timezone.utc)
+        db.commit()
+    return {"message": "Logged out"}
 
 # --- Routing & Logging ---
 async def get_decision(query: str, mode, threshold, explain: bool):

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, ForeignKey, Float, Index
 from sqlalchemy.sql import func
 from .database import Base
 
@@ -36,9 +36,16 @@ class UserPolicy(Base):
 
 class UsageLedger(Base):
     __tablename__ = "usage_ledger"
+    __table_args__ = (
+        # Composite index: every usage query the app actually makes filters by
+        # user_id AND orders/filters by ts together (e.g. "this user's usage
+        # since period start"). Two separate single-column indexes don't let
+        # SQLite/Postgres satisfy that in one index scan - a composite does.
+        Index("ix_usage_ledger_user_id_ts", "user_id", "ts"),
+    )
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    ts = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    ts = Column(DateTime(timezone=True), server_default=func.now())
     tier_used = Column(String, nullable=False)
     tokens_est = Column(Integer, default=0)
     cost_usd = Column(Float, default=0.0)

@@ -46,14 +46,41 @@ class GatewayTests(unittest.TestCase):
 
         from gateway import app as gw
         from gateway.tier_clients import StreamChunk
+        from gateway.db.models import User
 
         # Base.metadata only gets every table (including usage_ledger) registered
         # once gateway.db.models has actually been imported - do create_all AFTER
         # importing gateway.app above, not before, so nothing is missing.
         db_mod.Base.metadata.create_all(bind=cls.test_engine)
 
+        # A real, persisted user row (not a dependency-less stub) so current_user.id
+        # works exactly like it would for a real logged-in caller - including for
+        # PolicyEngine.evaluate(), which looks up this id. No UserPolicy row is
+        # created for it, so evaluate() takes its documented fail-open "no policy
+        # assigned" path, which is the correct behavior for these generic routing
+        # tests (test_integration_policy.py separately covers real policy
+        # enforcement through actual register/login).
+        _seed_db = cls.TestingSessionLocal()
+        cls._test_user = User(email="test@example.com", password_hash="unused-in-tests")
+        _seed_db.add(cls._test_user)
+        _seed_db.commit()
+        _seed_db.refresh(cls._test_user)
+        _test_user_id = cls._test_user.id
+        _seed_db.close()
+
+        def _fake_current_user():
+            # Fetch fresh in this request's own session rather than returning the
+            # detached setUpClass-time instance, so lazy attribute access can't
+            # raise sqlalchemy.orm.exc.DetachedInstanceError.
+            db = cls.TestingSessionLocal()
+            try:
+                return db.query(User).filter(User.id == _test_user_id).first()
+            finally:
+                db.close()
+
         cls._orig_overrides = dict(gw.app.dependency_overrides)
         gw.app.dependency_overrides[gw.get_db] = lambda: cls.TestingSessionLocal()
+        gw.app.dependency_overrides[gw.get_current_user] = _fake_current_user
 
         class FakeClient:
             def __init__(self, reply="ok from fake model"):
