@@ -41,7 +41,7 @@ git clone <your-repo-url> llm-smart-router && cd llm-smart-router
 
 bash scripts/setup_ubuntu.sh        # apt deps, venv, Ollama, pulls the model(s)
 
-# get a free key (email only): [https://console.groq.com/keys](https://console.groq.com/keys)
+# get a free key (email only): https://console.groq.com/keys
 nano .env                           # set HIGH_API_KEY=gsk_...
 
 source .venv/bin/activate
@@ -50,8 +50,8 @@ make data                           # download + label the dataset (~300 MB)
 make verify                         # Phase 1 exit-criteria check
 make bench                          # cold vs warm router latency
 make eval                           # zero-shot SLM routing accuracy (200 prompts)
-
 ```
+
 
 ### Phase 1 exit criteria (`make verify`)
 
