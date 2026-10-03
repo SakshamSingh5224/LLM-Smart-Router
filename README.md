@@ -1,4 +1,3 @@
-```markdown
 # LLM Smart Routing & Cost Optimization - Phase 1
 
 Environment, free model access, and the routing dataset for a gateway that sends
