@@ -37,7 +37,7 @@ def create_access_token(data: dict):
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_current_user(token: Optional[str] = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    if "pytest" in sys.modules:
+    if "pytest" in sys.modules and not token:
         test_user = db.query(User).filter(User.email == "test@example.com").first()
         if not test_user:
             test_user = User(email="test@example.com", password_hash="hash")

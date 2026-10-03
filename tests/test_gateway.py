@@ -18,14 +18,42 @@ except ImportError:
 os.environ.setdefault("ROUTER_ARTIFACT_PATH", str(Path(tempfile.gettempdir()) / "no_such_router.joblib"))
 os.environ.setdefault("HIGH_API_KEY", "test-key-not-used")
 os.environ.setdefault("GATEWAY_LOG_PATH", str(Path(tempfile.gettempdir()) / "test_gateway_log.jsonl"))
+os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 
 @unittest.skipUnless(HAVE_FASTAPI, "fastapi not installed")
 class GatewayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+
+        import gateway.db.database as db_mod
+
+        # These are process-wide singletons shared with every other test file in
+        # the same pytest run - save them so we can put them back exactly as they
+        # were, instead of leaking our throwaway DB into tests that run after us.
+        cls._orig_engine = db_mod.engine
+        cls._orig_session_local = db_mod.SessionLocal
+
+        cls.test_engine = create_engine(
+            "sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+        )
+        cls.TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=cls.test_engine)
+        db_mod.engine = cls.test_engine
+        db_mod.SessionLocal = cls.TestingSessionLocal
+
         from gateway import app as gw
         from gateway.tier_clients import StreamChunk
+
+        # Base.metadata only gets every table (including usage_ledger) registered
+        # once gateway.db.models has actually been imported - do create_all AFTER
+        # importing gateway.app above, not before, so nothing is missing.
+        db_mod.Base.metadata.create_all(bind=cls.test_engine)
+
+        cls._orig_overrides = dict(gw.app.dependency_overrides)
+        gw.app.dependency_overrides[gw.get_db] = lambda: cls.TestingSessionLocal()
 
         class FakeClient:
             def __init__(self, reply="ok from fake model"):
@@ -36,10 +64,23 @@ class GatewayTests(unittest.TestCase):
                     yield StreamChunk(delta=word + " ")
                 yield StreamChunk(done=True)
 
+        cls._orig_low_client = gw.low_client
+        cls._orig_high_client = gw.high_client
         gw.low_client = FakeClient("cheap answer")
         gw.high_client = FakeClient("expensive answer")
         cls.gw = gw
         cls.client = TestClient(gw.app)
+
+    @classmethod
+    def tearDownClass(cls):
+        import gateway.db.database as db_mod
+
+        cls.gw.app.dependency_overrides.clear()
+        cls.gw.app.dependency_overrides.update(cls._orig_overrides)
+        cls.gw.low_client = cls._orig_low_client
+        cls.gw.high_client = cls._orig_high_client
+        db_mod.engine = cls._orig_engine
+        db_mod.SessionLocal = cls._orig_session_local
 
     def test_health(self):
         r = self.client.get("/health")

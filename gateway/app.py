@@ -28,12 +28,13 @@ from gateway.settings import load_gateway_settings
 from gateway.tier_clients import StreamChunk, collect_stream, make_high_stream_client, make_low_stream_client
 from smartrouter.labels import HIGH, LOW
 
-from gateway.db.database import engine, Base, get_db, SessionLocal
+from gateway.db import database as db_module
+from gateway.db.database import get_db
 from gateway.db.models import User, Policy, UserPolicy
 from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user
 from gateway.policy import PolicyEngine
 
-Base.metadata.create_all(bind=engine)
+db_module.Base.metadata.create_all(bind=db_module.engine)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("gateway")
@@ -299,11 +300,13 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         tokens_est = max(1, len(full_text) // 4) if full_text else 0
         cost = cost_of(tier, tokens_est)
 
-        # Record usage via a fresh session context so it persists after StreamingResponse closes the main request
+        # Record usage via a fresh session context so it persists after StreamingResponse closes the main
+        # request. Goes through db_module.SessionLocal at call time (not a bare name copied at import
+        # time) so tests that monkeypatch gateway.db.database.SessionLocal are correctly picked up here too.
         if not err:
-            with SessionLocal() as record_db:
-                engine = PolicyEngine(record_db)
-                engine.record_usage(current_user.id, tier, tokens_est, cost, policy_decision.is_downgraded)
+            with db_module.SessionLocal() as record_db:
+                usage_engine = PolicyEngine(record_db)
+                usage_engine.record_usage(current_user.id, tier, tokens_est, cost, policy_decision.is_downgraded)
 
         total = _log_and_finish(request_id, req.query, decision, False, router_ms, gen_ms, ttft_ms, t0, tokens_est, err)
         yield sse("done", {"total_latency_ms": round(total, 1), "cache_hit": False, "tokens_est": tokens_est,
