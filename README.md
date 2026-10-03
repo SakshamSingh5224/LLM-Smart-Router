@@ -52,6 +52,7 @@ make eval                           # zero-shot SLM routing accuracy (200 prompt
 
 ```
 
+
 ### Phase 1 exit criteria (`make verify`)
 
 1. Ollama is running and the router model is installed
