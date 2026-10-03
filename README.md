@@ -1,3 +1,4 @@
+```markdown
 # LLM Smart Routing & Cost Optimization - Phase 1
 
 Environment, free model access, and the routing dataset for a gateway that sends
@@ -40,7 +41,7 @@ git clone <your-repo-url> llm-smart-router && cd llm-smart-router
 
 bash scripts/setup_ubuntu.sh        # apt deps, venv, Ollama, pulls the model(s)
 
-# get a free key (email only): https://console.groq.com/keys
+# get a free key (email only): [https://console.groq.com/keys](https://console.groq.com/keys)
 nano .env                           # set HIGH_API_KEY=gsk_...
 
 source .venv/bin/activate
@@ -49,6 +50,7 @@ make data                           # download + label the dataset (~300 MB)
 make verify                         # Phase 1 exit-criteria check
 make bench                          # cold vs warm router latency
 make eval                           # zero-shot SLM routing accuracy (200 prompts)
+
 ```
 
 ### Phase 1 exit criteria (`make verify`)
@@ -62,19 +64,21 @@ make eval                           # zero-shot SLM routing accuracy (200 prompt
 ## Push to GitHub
 
 ```bash
-# Option A - create an EMPTY repo on github.com/new first, then:
-bash scripts/push_to_github.sh https://github.com/<user>/<repo>.git
+# Option A - create an EMPTY repo on [github.com/new](https://github.com/new) first, then:
+bash scripts/push_to_github.sh [https://github.com/](https://github.com/)<user>/<repo>.git
 # (password prompt = a Personal Access Token with `repo` scope)
 
 # Option B - GitHub CLI
 sudo apt install -y gh && gh auth login
 bash scripts/push_to_github.sh
+
 ```
+
 `.env` (your key) and `data/`, `results/` are git-ignored.
 
 ## Layout
 
-```
+```text
 smartrouter/            shared library (Phase 1 + 2)
   config.py              settings from .env
   clients.py              OllamaClient, OpenAICompatClient (Groq etc.), 429 back-off
@@ -99,12 +103,13 @@ scripts/
   verify_phase3.py                                           Phase 3
   push_to_github.sh
 tests/                   offline unit tests (labels, parsing, curves, cache, gateway)
+
 ```
 
 ## Troubleshooting
 
 | Symptom | Fix |
-|---|---|
+| --- | --- |
 | `Ollama is not reachable` | `sudo systemctl start ollama` or `ollama serve &` |
 | Router latency above budget on CPU | `ROUTER_MODEL=qwen2.5:0.5b`, or raise `ROUTER_LATENCY_BUDGET_MS`. A BERT-style classifier in Phase 2 brings this to ms. |
 | `HTTP 401` from the high tier | wrong/missing `HIGH_API_KEY` |
@@ -118,6 +123,7 @@ tests/                   offline unit tests (labels, parsing, curves, cache, gat
 ```bash
 make train-router     # trains + calibrates -> results/router_artifact.joblib
 make eval-router       # cost-vs-quality curve on the held-out TEST split
+
 ```
 
 `scripts/train_router.py` fits a logistic-regression classifier on TF-IDF (+ hand-crafted
@@ -134,7 +140,7 @@ to beat.
 
 Wires up the full path: **browser → gateway → router → selected tier → streamed back**.
 
-```
+```text
 frontend/ (plain HTML/CSS/JS, no build step)
         │  fetch() + SSE
         ▼
@@ -146,6 +152,7 @@ router_service/app.py  (FastAPI, :8001, optional standalone deploy)
         │  falls back to smartrouter.rules if missing/broken (circuit breaker)
         ▼
 gateway/tier_clients.py → Ollama (low) or Groq (high), streamed
+
 ```
 
 ### Run it
@@ -160,6 +167,7 @@ make serve-gateway                # -> http://localhost:8000  (frontend is serve
 make serve-router                 # terminal 1 -> http://localhost:8001
 # then in .env set ROUTER_SERVICE_URL=http://localhost:8001
 make serve-gateway                # terminal 2 -> http://localhost:8000
+
 ```
 
 Open **http://localhost:8000** — type a prompt, watch it stream in, see which tier
@@ -173,6 +181,7 @@ estimated cost. Tick "explain routing" to see the classifier's reasoning per req
 
 ```bash
 make verify3     # gateway must already be running (make serve-gateway, separate terminal)
+
 ```
 
 Checks: `/health`, a full non-streaming `/api/chat` round trip, that
@@ -183,30 +192,50 @@ query is served from cache.
 ### API
 
 * `POST /api/chat` — `{query, mode?, threshold?, force_tier?, use_cache?, explain?}` → full
-  JSON answer + the routing decision + latency/cost breakdown.
+JSON answer + the routing decision + latency/cost breakdown.
 * `POST /api/chat/stream` — same body, Server-Sent Events: `meta` (routing decision) →
-  `delta` (token chunks) → `done` (totals). `force_tier` is a debug override for A/B
-  testing "always cheap" vs "always strong" vs "routed", per the plan's testing section.
+`delta` (token chunks) → `done` (totals). `force_tier` is a debug override for A/B
+testing "always cheap" vs "always strong" vs "routed", per the plan's testing section.
 * `GET /health`, `GET /modes`, `GET /logs/recent?n=20`
 * Router service (if run standalone): `POST /route`, `GET /health`, `GET /modes` —
-  exactly the contract from the Phase 2 plan.
+exactly the contract from the Phase 2 plan.
 
 ### What's intentionally simple (and the free/no-infra reason why)
 
 * **Cache** is in-process (normalized-text match + LRU/TTL), not Redis + embedding
-  similarity. No server to install, and it already skips repeated generation calls;
-  `gateway/cache.py` documents the swap-in point if you add Redis later.
+similarity. No server to install, and it already skips repeated generation calls;
+`gateway/cache.py` documents the swap-in point if you add Redis later.
 * **Frontend** is plain HTML/CSS/JS — no Node/npm/build step, one less thing to install
-  on a fresh Ubuntu box. `fetch()` + manual SSE parsing stands in for `EventSource`
-  because the stream needs a POST body.
+on a fresh Ubuntu box. `fetch()` + manual SSE parsing stands in for `EventSource`
+because the stream needs a POST body.
 * **Cost tracking** defaults to $0 (`COST_PER_1K_LOW/HIGH=0.0`) since both tiers are free;
-  set them to simulate what a paid deployment's cost dashboard would show.
+set them to simulate what a paid deployment's cost dashboard would show.
 * Gateway ↔ router is plain REST (`httpx`), not gRPC — the plan lists gRPC as a
-  scale optimization, not a Phase 3 requirement.
+scale optimization, not a Phase 3 requirement.
 
-## Next: Phase 4
+## Phase 2A — Identity & Database Foundation (Completed)
 
-Containerize (`router_service/`, `gateway/`, `frontend/` are already separable into three
-images), add Prometheus/Grafana over `results/gateway_log.jsonl`, load-test with k6/Locust
-against `/api/chat`, and wire up CI/CD for `results/router_artifact.joblib` updates
-independent of gateway/frontend deploys.
+MVP 2 adds identity and budget control on top of the routing gateway.
+
+* **Database Integration:** SQLAlchemy 2.0 ORM managing `users`, `refresh_tokens`, `policies`, `user_policy`, and `usage_ledger` tables via Postgres (Neon) or SQLite.
+
+
+* **Authentication:** Secure user registration (`/api/auth/register`) and login (`/api/auth/login`) using bcrypt password hashing and JWT access/refresh tokens.
+
+
+* **Protected Endpoints:** Core API endpoints (`/api/chat`, `/api/chat/stream`) now require a valid Bearer JWT header.
+
+
+* **Frontend UI:** Dark-mode login and registration interface integrated seamlessly with the chat application, managing local session state and handling 401 redirects.
+
+## Next Steps: Phase 2B, 2C & Phase 4
+
+* **Phase 2B (Policy Engine & Usage Enforcement):** Implementing per-user quotas, auto-downgrading when budget is exhausted, and forcing tier overrides independent of the classifier.
+
+
+* **Phase 2C (Admin Dashboard & Observability):** Building UI for managing user policies and integrating Grafana/Prometheus metrics for policy decisions (`policy_decision_total`).
+
+
+* **Phase 4:** Containerize (`router_service/`, `gateway/`, `frontend/`), load-test with k6/Locust, and wire up CI/CD for `results/router_artifact.joblib` updates.
+
+
