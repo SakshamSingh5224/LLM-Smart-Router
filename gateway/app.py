@@ -34,6 +34,13 @@ from gateway.db.models import User, Policy, UserPolicy, RefreshToken
 from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user, create_refresh_token, hash_token
 from gateway.policy import PolicyEngine
 
+# Alembic (migrations/) is now the source of truth for schema CHANGES in
+# production - run `alembic upgrade head` as part of deploy, not this line.
+# create_all() is kept only as a dev/test convenience: it's a no-op against a
+# database Alembic already migrated (it never alters existing tables), and
+# it's what lets tests/test_gateway.py and tests/test_integration_policy.py
+# stand up their own throwaway in-memory SQLite databases without needing to
+# run the whole migration chain for every test run.
 db_module.Base.metadata.create_all(bind=db_module.engine)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")

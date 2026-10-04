@@ -1,6 +1,6 @@
 PY := .venv/bin/python
 
-.PHONY: setup data verify bench eval train-router eval-router serve-router serve-gateway verify3 test all-phase1 all-phase2
+.PHONY: setup data verify bench eval train-router eval-router serve-router serve-gateway verify3 test all-phase1 all-phase2 migrate migrate-new migrate-stamp
 
 setup:  ## install system deps, Ollama, models, python env
 	bash scripts/setup_ubuntu.sh
@@ -34,6 +34,15 @@ verify3:  ## Phase 3 exit-criteria check (gateway must already be running)
 
 test:  ## offline unit tests
 	$(PY) -m unittest discover -s tests -v
+
+migrate:  ## apply all pending Alembic migrations to whatever DATABASE_URL points at
+	.venv/bin/alembic upgrade head
+
+migrate-new:  ## autogenerate a new migration from model changes (edit before applying!); usage: make migrate-new m="add foo column"
+	.venv/bin/alembic revision --autogenerate -m "$(m)"
+
+migrate-stamp:  ## mark an EXISTING database (tables already created by create_all) as already at baseline, with no DDL run
+	.venv/bin/alembic stamp head
 
 all-phase1: data verify bench eval
 
