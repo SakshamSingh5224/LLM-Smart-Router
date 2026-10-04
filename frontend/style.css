@@ -90,6 +90,58 @@ button#send {
 button#send:hover { background: var(--accent-hover); }
 .hint { color: var(--muted); font-size: 11px; margin-top: 12px; text-align: center; }
 
+/* --- Phase 2C: Usage / Admin panels --- */
+.icon-btn {
+  background: var(--panel); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer;
+}
+.icon-btn:hover { background: rgba(255,255,255,0.05); }
+
+.side-panel {
+  margin: 0 24px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; overflow: hidden;
+}
+.side-panel.hidden { display: none; }
+.panel-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
+}
+.panel-header h3 { margin: 0; font-size: 14px; }
+.panel-close {
+  background: none; border: none; color: var(--muted); font-size: 18px;
+  cursor: pointer; line-height: 1; padding: 0 4px;
+}
+.panel-close:hover { color: var(--text); }
+.panel-body { padding: 16px; font-size: 13px; max-height: 320px; overflow-y: auto; }
+
+.usage-meta { margin: 0 0 12px; color: var(--muted); }
+.usage-row { display: flex; justify-content: space-between; margin: 10px 0 4px; }
+.usage-unlimited { color: var(--low-text); font-weight: 600; }
+.usage-bar { height: 8px; background: var(--bg); border-radius: 4px; overflow: hidden; border: 1px solid var(--border); }
+.usage-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+.usage-bar-fill.ok { background: var(--low-text); }
+.usage-bar-fill.warn { background: #facc15; }
+.usage-bar-fill.danger { background: var(--high-text); }
+
+.admin-table { width: 100%; border-collapse: collapse; }
+.admin-table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px;
+  text-transform: uppercase; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.admin-table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.admin-badge {
+  background: var(--high-bg); color: var(--high-text); font-size: 10px; font-weight: 700;
+  padding: 1px 6px; border-radius: 4px; margin-left: 4px;
+}
+.policy-select {
+  background: var(--bg); color: var(--text); border: 1px solid var(--border);
+  border-radius: 4px; padding: 4px 6px; font: inherit; font-size: 12px;
+}
+.reassign-btn {
+  background: var(--accent); color: white; border: none; border-radius: 4px;
+  padding: 4px 10px; font-size: 12px; cursor: pointer; margin-left: 6px;
+}
+.reassign-btn:hover { background: var(--accent-hover); }
+.error-text { color: var(--error); }
+
 /* Markdown Styles Inherited */
 .bubble.markdown { white-space: normal; }
 .bubble.markdown p { margin: 0.5em 0; }

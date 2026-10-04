@@ -7,7 +7,7 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import Counter
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 from gateway.cache import ResponseCache
@@ -69,6 +70,13 @@ app.add_middleware(
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 api_guard = make_guard(cfg.api_key or None, cfg.rate_limit_per_min)
 
+# Phase 2C: exposed at the same /metrics endpoint Prometheus already scrapes
+# (docker/prometheus.yml). Label cardinality is bounded - only 4 possible
+# values ("allow" | "downgrade_to_low" | "block" | "allow_overage").
+POLICY_DECISION_COUNTER = Counter(
+    "policy_decision_total", "Routing decisions made by the policy engine, by action", ["action"],
+)
+
 SYSTEM_PROMPT = "You are a helpful, concise assistant."
 
 class ChatRequest(BaseModel):
@@ -111,6 +119,66 @@ class UserLogin(BaseModel):
     
 class RefreshRequest(BaseModel):
     refresh_token: str
+
+class PolicyOut(BaseModel):
+    model_config = {"from_attributes": True}
+    id: int
+    name: str
+    tier_scope: str
+    query_threshold: Optional[int] = None
+    token_threshold: Optional[int] = None
+    period: str
+    action_on_exhaustion: str
+
+class PolicyCreate(BaseModel):
+    name: str
+    tier_scope: str = "all"
+    query_threshold: Optional[int] = None
+    token_threshold: Optional[int] = None
+    period: str = "monthly"
+    action_on_exhaustion: str = "downgrade_to_low"
+
+class PolicyUpdate(BaseModel):
+    # name is deliberately NOT patchable: "free"/"trusted"/"admin" are looked up
+    # by name elsewhere (e.g. register() assigns "free" by name) - renaming one
+    # here would silently break that. Create a new policy instead.
+    tier_scope: Optional[str] = None
+    query_threshold: Optional[int] = None
+    token_threshold: Optional[int] = None
+    period: Optional[str] = None
+    action_on_exhaustion: Optional[str] = None
+
+class UserAdminOut(BaseModel):
+    id: int
+    email: str
+    is_admin: bool
+    policy_id: Optional[int] = None
+    policy_name: Optional[str] = None
+    queries_used: int
+    tokens_used: int
+
+class ReassignPolicyRequest(BaseModel):
+    policy_id: int
+
+class UsageOut(BaseModel):
+    policy_name: str
+    tier_scope: str
+    period: str
+    action_on_exhaustion: str
+    query_threshold: Optional[int] = None
+    token_threshold: Optional[int] = None
+    queries_used: int
+    tokens_used: int
+
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    """Gate on current_user.is_admin loaded fresh from the DB on every call -
+    NOT a JWT claim. A claim could stay "admin" for up to ACCESS_TOKEN_EXPIRE_MINUTES
+    after an admin's status was revoked in the database; a DB check is never stale."""
+    if not current_user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
 
 # --- Auth Endpoints ---
 _seeded_engines: set[int] = set()
@@ -194,6 +262,80 @@ def logout(req: RefreshRequest, db: Session = Depends(get_db)):
         db.commit()
     return {"message": "Logged out"}
 
+
+# --- Phase 2C: self-service usage + admin endpoints ---
+@app.get("/api/me/usage", response_model=UsageOut)
+def my_usage(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    engine = PolicyEngine(db)
+    policy = engine.get_user_policy(current_user.id)
+    if not policy:
+        raise HTTPException(status_code=404, detail="No policy assigned to this account")
+    usage = engine.get_current_usage(current_user.id, policy.tier_scope)
+    return UsageOut(
+        policy_name=policy.name, tier_scope=policy.tier_scope, period=policy.period,
+        action_on_exhaustion=policy.action_on_exhaustion,
+        query_threshold=policy.query_threshold, token_threshold=policy.token_threshold,
+        queries_used=usage["queries"], tokens_used=usage["tokens"],
+    )
+
+@app.get("/api/admin/policies", response_model=List[PolicyOut])
+def admin_list_policies(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    return db.query(Policy).order_by(Policy.id).all()
+
+@app.post("/api/admin/policies", response_model=PolicyOut)
+def admin_create_policy(req: PolicyCreate, admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    if db.query(Policy).filter(Policy.name == req.name).first():
+        raise HTTPException(status_code=400, detail=f"Policy '{req.name}' already exists")
+    p = Policy(**req.model_dump())
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return p
+
+@app.patch("/api/admin/policies/{policy_id}", response_model=PolicyOut)
+def admin_update_policy(policy_id: int, req: PolicyUpdate, admin: User = Depends(require_admin),
+                        db: Session = Depends(get_db)):
+    p = db.query(Policy).filter(Policy.id == policy_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    for field, value in req.model_dump(exclude_unset=True).items():
+        setattr(p, field, value)
+    db.commit()
+    db.refresh(p)
+    return p
+
+@app.get("/api/admin/users", response_model=List[UserAdminOut])
+def admin_list_users(admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    engine = PolicyEngine(db)
+    out = []
+    for u in db.query(User).order_by(User.id).all():
+        policy = engine.get_user_policy(u.id)
+        usage = engine.get_current_usage(u.id, policy.tier_scope if policy else "all")
+        out.append(UserAdminOut(
+            id=u.id, email=u.email, is_admin=u.is_admin,
+            policy_id=policy.id if policy else None, policy_name=policy.name if policy else None,
+            queries_used=usage["queries"], tokens_used=usage["tokens"],
+        ))
+    return out
+
+@app.patch("/api/admin/users/{user_id}/policy")
+def admin_reassign_user_policy(user_id: int, req: ReassignPolicyRequest,
+                               admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    policy = db.query(Policy).filter(Policy.id == req.policy_id).first()
+    if not policy:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    up = db.query(UserPolicy).filter(UserPolicy.user_id == user_id).first()
+    if up:
+        up.policy_id = policy.id
+    else:
+        db.add(UserPolicy(user_id=user_id, policy_id=policy.id))
+    db.commit()
+    return {"message": f"User {user_id} reassigned to policy '{policy.name}'"}
+
+
 # --- Routing & Logging ---
 async def get_decision(query: str, mode, threshold, explain: bool):
     t0 = time.perf_counter()
@@ -252,6 +394,7 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
     # 1. Policy Evaluation
     policy_engine = PolicyEngine(db)
     policy_decision = policy_engine.evaluate(current_user.id)
+    POLICY_DECISION_COUNTER.labels(action=policy_decision.action).inc()
     
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
@@ -311,6 +454,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
     # 1. Policy Evaluation
     policy_engine = PolicyEngine(db)
     policy_decision = policy_engine.evaluate(current_user.id)
+    POLICY_DECISION_COUNTER.labels(action=policy_decision.action).inc()
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
 

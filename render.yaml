@@ -53,6 +53,10 @@ services:
         sync: false            # set manually in the dashboard (your Groq key)
       - key: GATEWAY_API_KEY
         sync: false            # set manually - your own secret; required by the frontend/k6 as X-API-Key
+      - key: DATABASE_URL
+        sync: false            # set manually - your Neon pooled connection string (MVP 2 Phase 2A)
+      - key: JWT_SECRET
+        sync: false            # set manually - a long random string; rotating it invalidates all sessions
       - key: GATEWAY_CORS_ORIGINS
         value: "*"             # tighten to your Vercel domain once you have it, e.g. https://your-app.vercel.app
       - key: GATEWAY_CACHE_ENABLED

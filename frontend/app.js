@@ -190,4 +190,139 @@ document.addEventListener("DOMContentLoaded", () => {
         thread.appendChild(msgDiv);
         thread.scrollTop = thread.scrollHeight;
     }
+
+    // --- Phase 2C: shared authed-fetch helper (same 401 -> redirect behavior
+    // as the main chat request above, reused for the usage/admin panels) ---
+    async function authedFetch(path, opts = {}) {
+        const res = await fetch(`${API_BASE}${path}`, {
+            ...opts,
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}`, ...(opts.headers || {}) },
+        });
+        if (res.status === 401) {
+            localStorage.removeItem('token');
+            window.location.href = '/index.html';
+            throw new Error('Session expired');
+        }
+        return res;
+    }
+
+    // --- Phase 2C: "My Usage" panel (GET /api/me/usage) ---
+    const usageBtn = document.getElementById('usageBtn');
+    const usagePanel = document.getElementById('usagePanel');
+    const usageContent = document.getElementById('usageContent');
+    const adminBtn = document.getElementById('adminBtn');
+    const adminPanel = document.getElementById('adminPanel');
+    const adminContent = document.getElementById('adminContent');
+
+    function togglePanel(panel) { panel.classList.toggle('hidden'); }
+    document.querySelectorAll('.panel-close').forEach((btn) => {
+        btn.addEventListener('click', () => document.getElementById(btn.dataset.close).classList.add('hidden'));
+    });
+
+    function renderUsageBar(used, limit, label) {
+        if (limit == null) {
+            return `<div class="usage-row"><span>${label}</span><span class="usage-unlimited">unlimited</span></div>`;
+        }
+        const pct = Math.min(100, Math.round((used / limit) * 100));
+        const barClass = pct >= 100 ? 'danger' : pct >= 75 ? 'warn' : 'ok';
+        return `
+            <div class="usage-row"><span>${label}</span><span>${used} / ${limit}</span></div>
+            <div class="usage-bar"><div class="usage-bar-fill ${barClass}" style="width:${pct}%"></div></div>
+        `;
+    }
+
+    async function loadUsage() {
+        usageContent.innerHTML = 'Loading…';
+        try {
+            const res = await authedFetch('/api/me/usage');
+            if (!res.ok) { usageContent.innerHTML = 'No policy assigned yet.'; return; }
+            const d = await res.json();
+            usageContent.innerHTML = `
+                <p class="usage-meta">Policy: <strong>${d.policy_name}</strong> ·
+                    action on exhaustion: <code>${d.action_on_exhaustion}</code> · resets monthly</p>
+                ${renderUsageBar(d.queries_used, d.query_threshold, 'Queries this month')}
+                ${d.token_threshold != null ? renderUsageBar(d.tokens_used, d.token_threshold, 'Tokens this month') : ''}
+            `;
+        } catch (e) {
+            usageContent.innerHTML = `<span class="error-text">Could not load usage: ${e.message}</span>`;
+        }
+    }
+
+    usageBtn.addEventListener('click', () => {
+        togglePanel(usagePanel);
+        if (!usagePanel.classList.contains('hidden')) loadUsage();
+    });
+
+    // --- Phase 2C: Admin panel (GET /api/admin/users + /api/admin/policies,
+    // PATCH /api/admin/users/{id}/policy to reassign) ---
+    async function loadAdmin() {
+        adminContent.innerHTML = 'Loading…';
+        try {
+            const [usersRes, policiesRes] = await Promise.all([
+                authedFetch('/api/admin/users'),
+                authedFetch('/api/admin/policies'),
+            ]);
+            if (!usersRes.ok || !policiesRes.ok) { adminContent.innerHTML = 'Admin access required.'; return; }
+            const users = await usersRes.json();
+            const policies = await policiesRes.json();
+
+            const policyOptions = policies.map((p) => `<option value="${p.id}">${p.name}</option>`).join('');
+            adminContent.innerHTML = `
+                <table class="admin-table">
+                    <thead><tr><th>User</th><th>Usage (this month)</th><th>Policy</th></tr></thead>
+                    <tbody>
+                        ${users.map((u) => `
+                            <tr data-user-id="${u.id}">
+                                <td>${u.email}${u.is_admin ? ' <span class="admin-badge">admin</span>' : ''}</td>
+                                <td>${u.queries_used} q / ${u.tokens_used} tok</td>
+                                <td>
+                                    <select class="policy-select">${policyOptions}</select>
+                                    <button type="button" class="reassign-btn">Save</button>
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+            users.forEach((u) => {
+                if (u.policy_id == null) return;
+                const sel = adminContent.querySelector(`tr[data-user-id="${u.id}"] .policy-select`);
+                if (sel) sel.value = u.policy_id;
+            });
+            adminContent.querySelectorAll('.reassign-btn').forEach((btn) => {
+                btn.addEventListener('click', async () => {
+                    const row = btn.closest('tr');
+                    const userId = row.dataset.userId;
+                    const policyId = parseInt(row.querySelector('.policy-select').value, 10);
+                    btn.disabled = true;
+                    btn.textContent = 'Saving…';
+                    try {
+                        const res = await authedFetch(`/api/admin/users/${userId}/policy`, {
+                            method: 'PATCH',
+                            body: JSON.stringify({ policy_id: policyId }),
+                        });
+                        btn.textContent = res.ok ? 'Saved ✓' : 'Failed';
+                    } catch (e) {
+                        btn.textContent = 'Failed';
+                    } finally {
+                        setTimeout(() => { btn.disabled = false; btn.textContent = 'Save'; }, 1500);
+                    }
+                });
+            });
+        } catch (e) {
+            adminContent.innerHTML = `<span class="error-text">Could not load admin data: ${e.message}</span>`;
+        }
+    }
+
+    adminBtn.addEventListener('click', () => {
+        togglePanel(adminPanel);
+        if (!adminPanel.classList.contains('hidden')) loadAdmin();
+    });
+
+    // Reveal the Admin button only for accounts that actually pass require_admin
+    // server-side - this is a UI convenience, not the security boundary (the
+    // /api/admin/* endpoints enforce it themselves regardless of this check).
+    authedFetch('/api/admin/policies').then((res) => {
+        if (res.ok) adminBtn.style.display = '';
+    }).catch(() => {});
 });

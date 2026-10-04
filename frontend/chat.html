@@ -27,9 +27,29 @@
         <label class="checkbox">
           <input type="checkbox" id="explain" checked /> explain routing
         </label>
+        <button type="button" id="usageBtn" class="icon-btn">Usage</button>
+        <button type="button" id="adminBtn" class="icon-btn" style="display:none">Admin</button>
         <span id="health" class="health ok" title="gateway / router status">●</span>
       </div>
     </header>
+
+    <!-- Phase 2C: "my usage" panel (GET /api/me/usage) -->
+    <div id="usagePanel" class="side-panel hidden">
+      <div class="panel-header">
+        <h3>My Usage</h3>
+        <button type="button" class="panel-close" data-close="usagePanel">&times;</button>
+      </div>
+      <div id="usageContent" class="panel-body">Loading…</div>
+    </div>
+
+    <!-- Phase 2C: admin panel (GET /api/admin/users, /api/admin/policies, PATCH reassign) -->
+    <div id="adminPanel" class="side-panel hidden">
+      <div class="panel-header">
+        <h3>Admin — Users</h3>
+        <button type="button" class="panel-close" data-close="adminPanel">&times;</button>
+      </div>
+      <div id="adminContent" class="panel-body">Loading…</div>
+    </div>
 
     <main id="thread" aria-live="polite"></main>
 
