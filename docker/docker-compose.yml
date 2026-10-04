@@ -36,6 +36,12 @@ services:
       HIGH_API_KEY: "${HIGH_API_KEY:?set HIGH_API_KEY in .env}"
       GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
       GATEWAY_CORS_ORIGINS: "*"
+      # Added for Phase 4 load/chaos testing: without these, this container
+      # silently falls back to SQLite (chokes under concurrent load-test writes)
+      # and the default 30 req/min rate limit (dominates results at load-test
+      # volume). Both still default sanely for normal local dev use.
+      DATABASE_URL: "${DATABASE_URL:-}"
+      GATEWAY_RATE_LIMIT_PER_MIN: "${GATEWAY_RATE_LIMIT_PER_MIN:-30}"
     depends_on: [router_service]
     restart: unless-stopped
 

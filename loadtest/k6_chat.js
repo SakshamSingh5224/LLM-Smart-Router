@@ -6,6 +6,11 @@
 // Run:         k6 run loadtest/k6_chat.js
 // Against a deployed gateway:
 //              BASE_URL=https://your-gateway.onrender.com API_KEY=your-key k6 run loadtest/k6_chat.js
+//
+// Each VU registers + logs in its own account on first use (cached per VU for
+// the rest of the run) rather than sharing one login - now required since
+// /api/chat is authenticated, and avoids one account's "free" policy quota
+// (50 queries/month) being exhausted and downgrading every request mid-test.
 
 import http from "k6/http";
 import { check, sleep } from "k6";
@@ -14,10 +19,12 @@ import { Trend, Rate } from "k6/metrics";
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8000";
 const API_KEY = __ENV.API_KEY || "";
 const MAX_VUS = Number(__ENV.MAX_VUS || 100);
+const PASSWORD = "LoadTest123!";
 
 const routerLatency = new Trend("router_latency_ms");
 const genLatency = new Trend("generation_latency_ms");
 const highTierShare = new Rate("routed_to_high_tier");
+const authFailRate = new Rate("auth_failed");
 
 const PROMPTS = [
   "hi",
@@ -49,9 +56,37 @@ export const options = {
   },
 };
 
+// Per-VU token cache. k6 reuses the same VU (and its JS heap) across iterations
+// within a scenario, so this persists for the life of that VU without needing
+// a shared-state workaround.
+const tokenByVU = {};
+
+function getToken() {
+  const vu = String(__VU);
+  if (tokenByVU[vu]) return tokenByVU[vu];
+
+  const email = `loadtest-vu${vu}-${Date.now()}@test.local`;
+  http.post(`${BASE_URL}/api/auth/register`, JSON.stringify({ email, password: PASSWORD }),
+    { headers: { "Content-Type": "application/json" } });
+  const loginRes = http.post(`${BASE_URL}/api/auth/login`, JSON.stringify({ email, password: PASSWORD }),
+    { headers: { "Content-Type": "application/json" } });
+
+  let token = "";
+  try {
+    token = JSON.parse(loginRes.body).access_token || "";
+  } catch {
+    /* leave token empty; authFailRate below will flag it */
+  }
+  authFailRate.add(!token);
+  tokenByVU[vu] = token;
+  return token;
+}
+
 export default function () {
   const query = PROMPTS[Math.floor(Math.random() * PROMPTS.length)];
+  const token = getToken();
   const headers = { "Content-Type": "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
   if (API_KEY) headers["X-API-Key"] = API_KEY;
 
   const res = http.post(
