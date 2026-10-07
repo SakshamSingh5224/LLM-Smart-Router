@@ -30,3 +30,7 @@ psycopg[binary]
 qdrant-client>=1.12,<2
 pypdf>=5.0
 fastembed>=0.3
+
+#MVP 3C
+chromadb
+sentence-transformers
