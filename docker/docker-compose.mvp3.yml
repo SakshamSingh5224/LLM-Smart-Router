@@ -1,0 +1,15 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: llm-router-qdrant
+    restart: unless-stopped
+
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+
+    volumes:
+      - qdrant_storage:/qdrant/storage
+
+volumes:
+  qdrant_storage:

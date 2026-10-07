@@ -31,6 +31,26 @@ class GatewaySettings:
     api_key: str = ""                   # if set, /api/* requires header X-API-Key: <this>
     rate_limit_per_min: int = 30        # per API key (or per IP if no key configured)
 
+    # MVP 3 Routing Settings
+    enable_mvp3_routing: bool = True
+    intent_threshold: float = 0.70
+    indian_context_keywords: list = field(
+        default_factory=lambda: [
+            "isro",
+            "ncert",
+            "chandrayaan",
+            "supreme court",
+            "indian budget",
+            "indian regulation",
+            "bharat",
+        ]
+    )
+
+    # Phase 3C Retrieval Settings
+    chroma_db_dir: Path = ROOT / "results" / "chroma_db"
+    retrieval_top_k: int = 3
+    retrieval_distance_threshold: float = 0.7
+
     def __post_init__(self):
         override = os.getenv("GATEWAY_LOG_PATH")
         if override:
@@ -45,6 +65,21 @@ class GatewaySettings:
 def load_gateway_settings() -> GatewaySettings:
     e = os.getenv
     origins = e("GATEWAY_CORS_ORIGINS", "*")
+    
+    keywords_raw = e("INDIAN_CONTEXT_KEYWORDS", "")
+    if keywords_raw:
+        keywords_list = [k.strip() for k in keywords_raw.split(",") if k.strip()]
+    else:
+        keywords_list = [
+            "isro",
+            "ncert",
+            "chandrayaan",
+            "supreme court",
+            "indian budget",
+            "indian regulation",
+            "bharat",
+        ]
+
     return GatewaySettings(
         model=load_model_settings(),
         host=e("GATEWAY_HOST", "0.0.0.0"),
@@ -62,4 +97,10 @@ def load_gateway_settings() -> GatewaySettings:
         cost_per_1k_high=float(e("COST_PER_1K_HIGH", "0.0")),
         api_key=e("GATEWAY_API_KEY", ""),
         rate_limit_per_min=int(e("GATEWAY_RATE_LIMIT_PER_MIN", "30")),
+        enable_mvp3_routing=e("ENABLE_MVP3_ROUTING", "true").lower() in ("1", "true", "yes"),
+        intent_threshold=float(e("INTENT_THRESHOLD", "0.70")),
+        indian_context_keywords=keywords_list,
+        chroma_db_dir=Path(e("GATEWAY_CHROMA_DB_DIR", str(ROOT / "results" / "chroma_db"))),
+        retrieval_top_k=int(e("RETRIEVAL_TOP_K", "3")),
+        retrieval_distance_threshold=float(e("RETRIEVAL_DISTANCE_THRESHOLD", "0.7")),
     )

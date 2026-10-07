@@ -25,3 +25,8 @@ alembic
 bcrypt
 python-jose[cryptography]
 psycopg[binary]
+
+# MVP 3A - Local RAG ingestion + vector infrastructure
+qdrant-client>=1.12,<2
+pypdf>=5.0
+fastembed>=0.3

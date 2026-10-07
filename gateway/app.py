@@ -34,14 +34,9 @@ from gateway.db.database import get_db
 from gateway.db.models import User, Policy, UserPolicy, RefreshToken
 from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user, create_refresh_token, hash_token
 from gateway.policy import PolicyEngine
+from gateway.judge import QueryJudge
+from gateway.retriever import LocalRetriever
 
-# Alembic (migrations/) is now the source of truth for schema CHANGES in
-# production - run `alembic upgrade head` as part of deploy, not this line.
-# create_all() is kept only as a dev/test convenience: it's a no-op against a
-# database Alembic already migrated (it never alters existing tables), and
-# it's what lets tests/test_gateway.py and tests/test_integration_policy.py
-# stand up their own throwaway in-memory SQLite databases without needing to
-# run the whole migration chain for every test run.
 db_module.Base.metadata.create_all(bind=db_module.engine)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -50,6 +45,9 @@ log = logging.getLogger("gateway")
 cfg = load_gateway_settings()
 router, router_status = load_router(cfg.router_artifact_path)
 log.info("Router status: %s", router_status)
+
+judge = QueryJudge()
+retriever = LocalRetriever()
 
 low_client = make_low_stream_client(cfg.model)
 high_client = make_high_stream_client(cfg.model)
@@ -70,9 +68,6 @@ app.add_middleware(
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 api_guard = make_guard(cfg.api_key or None, cfg.rate_limit_per_min)
 
-# Phase 2C: exposed at the same /metrics endpoint Prometheus already scrapes
-# (docker/prometheus.yml). Label cardinality is bounded - only 4 possible
-# values ("allow" | "downgrade_to_low" | "block" | "allow_overage").
 POLICY_DECISION_COUNTER = Counter(
     "policy_decision_total", "Routing decisions made by the policy engine, by action", ["action"],
 )
@@ -139,9 +134,6 @@ class PolicyCreate(BaseModel):
     action_on_exhaustion: str = "downgrade_to_low"
 
 class PolicyUpdate(BaseModel):
-    # name is deliberately NOT patchable: "free"/"trusted"/"admin" are looked up
-    # by name elsewhere (e.g. register() assigns "free" by name) - renaming one
-    # here would silently break that. Create a new policy instead.
     tier_scope: Optional[str] = None
     query_threshold: Optional[int] = None
     token_threshold: Optional[int] = None
@@ -172,9 +164,6 @@ class UsageOut(BaseModel):
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    """Gate on current_user.is_admin loaded fresh from the DB on every call -
-    NOT a JWT claim. A claim could stay "admin" for up to ACCESS_TOKEN_EXPIRE_MINUTES
-    after an admin's status was revoked in the database; a DB check is never stale."""
     if not current_user.is_admin:
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
@@ -184,11 +173,6 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
 _seeded_engines: set[int] = set()
 
 def seed_default_policies(db: Session):
-    # Keyed by the engine's identity (not a bare process-wide flag) so each
-    # distinct database - the one real prod engine, and each test file's own
-    # throwaway in-memory engine - gets seeded exactly once on its own first
-    # call, instead of re-running 3 SELECTs + a commit on every single
-    # /api/auth/register request forever after the policies already exist.
     engine_key = id(db.get_bind())
     if engine_key in _seeded_engines:
         return
@@ -229,6 +213,7 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
     access_token = create_access_token(data={"sub": str(db_user.id)})
     refresh_token = create_refresh_token(db, db_user.id)
     return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
+
 @app.post("/api/auth/refresh")
 def refresh_access_token(req: RefreshRequest, db: Session = Depends(get_db)):
     invalid = HTTPException(status_code=401, detail="Invalid or expired refresh token")
@@ -241,8 +226,6 @@ def refresh_access_token(req: RefreshRequest, db: Session = Depends(get_db)):
         raise invalid
     expires_at = rt.expires_at
     if expires_at is not None:
-        # SQLite returns this naive; Postgres/Neon returns it tz-aware. Normalize
-        # before comparing so this doesn't crash only in production.
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if expires_at < datetime.now(timezone.utc):
@@ -250,11 +233,9 @@ def refresh_access_token(req: RefreshRequest, db: Session = Depends(get_db)):
 
     access_token = create_access_token(data={"sub": str(rt.user_id)})
     return {"access_token": access_token, "token_type": "bearer"}
+
 @app.post("/api/auth/logout")
 def logout(req: RefreshRequest, db: Session = Depends(get_db)):
-    # Idempotent and silent either way (unknown token, already-revoked token, or a
-    # freshly-revoked one all respond identically) so this endpoint never leaks
-    # whether a given refresh token string is/was valid.
     token_hash = hash_token(req.refresh_token)
     rt = db.query(RefreshToken).filter(RefreshToken.token_hash == token_hash).first()
     if rt and rt.revoked_at is None:
@@ -399,19 +380,34 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
 
-    # 2. Routing (Bypass if downgraded)
+    # 2. Phase 3B & 3C: Intent Routing & Local Retrieval
+    augmented_query = req.query
+    if cfg.enable_mvp3_routing:
+        intent_decision = judge.classify_intent(req.query)
+        if intent_decision.route == "LOCAL_KB":
+            context = retriever.search(req.query)
+            if context:
+                augmented_query = (
+                    "Use the following verified context to answer the question.\n\n"
+                    f"Context:\n{context}\n\n"
+                    f"Question: {req.query}"
+                )
+
+    # 3. Routing (Bypass if downgraded)
     if policy_decision.is_downgraded:
         decision = {"tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0, 
                     "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason}
         router_ms = 0.0
         tier = LOW
     else:
+        # Note: External router still evaluates the original query to determine tier
         decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
         tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
 
-    # 3. Cache & Generation
+    # 4. Cache & Generation
     cache_hit = False
     if cache and req.use_cache:
+        # Cache keyed strictly on the original short query
         hit = cache.get(req.query, mode)
         if hit:
             total = _log_and_finish(request_id, req.query, decision, True, router_ms, 0.0, None, t0, 0)
@@ -422,14 +418,15 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
                                 downgraded=policy_decision.is_downgraded)
 
     client = tier_client(tier)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": req.query}]
+    # Inject the augmented query containing retrieved context directly to the LLM
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
     stats = await collect_stream(client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens))
     
     if stats.error:
         _log_and_finish(request_id, req.query, decision, False, router_ms, stats.latency_ms, None, t0, 0, stats.error)
         raise HTTPException(status_code=502, detail=f"{tier} tier error: {stats.error}")
 
-    # 4. Record Usage and Return
+    # 5. Record Usage and Return
     cost = cost_of(tier, stats.tokens_est)
     policy_engine.record_usage(current_user.id, tier, stats.tokens_est, cost, policy_decision.is_downgraded)
     
@@ -458,6 +455,20 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
 
+    # 2. Phase 3B & 3C: Intent Routing & Local Retrieval
+    augmented_query = req.query
+    if cfg.enable_mvp3_routing:
+        intent_decision = judge.classify_intent(req.query)
+        if intent_decision.route == "LOCAL_KB":
+            context = retriever.search(req.query)
+            if context:
+                augmented_query = (
+                    "Use the following verified context to answer the question.\n\n"
+                    f"Context:\n{context}\n\n"
+                    f"Question: {req.query}"
+                )
+
+    # 3. Routing (Bypass if downgraded)
     if policy_decision.is_downgraded:
         decision = {"tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0, 
                     "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason}
@@ -475,7 +486,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                            "router_latency_ms": round(router_ms, 1), "downgraded": policy_decision.is_downgraded})
 
         client = tier_client(tier)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": req.query}]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
         text_parts, ttft_ms, gen_t0, err = [], None, time.perf_counter(), None
         
         async for chunk in client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens):
@@ -496,9 +507,6 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         tokens_est = max(1, len(full_text) // 4) if full_text else 0
         cost = cost_of(tier, tokens_est)
 
-        # Record usage via a fresh session context so it persists after StreamingResponse closes the main
-        # request. Goes through db_module.SessionLocal at call time (not a bare name copied at import
-        # time) so tests that monkeypatch gateway.db.database.SessionLocal are correctly picked up here too.
         if not err:
             with db_module.SessionLocal() as record_db:
                 usage_engine = PolicyEngine(record_db)
