@@ -323,3 +323,63 @@ revised based on measured knowledge-base behavior.
 The exact `bge-reranker-base` pipeline is intended for local development. The
 Render Free deployment disables MVP 3C retrieval by default because the full
 reranker is not appropriate for a 512 MB service; Qdrant can remain external.
+
+## Phase 3D — Local RAG Generation (Completed)
+
+Phase 3D connects the validated Phase 3B/3C knowledge-base path to the existing
+Ollama streaming client without replacing the existing LOW/HIGH router.
+
+### Flow
+
+```text
+User Query
+   |
+   v
+3B Intent Judge
+   |
+   +-- EXTERNAL_LLM ----------------------> existing LOW/HIGH routing
+   |
+   +-- LOCAL_KB
+          |
+          v
+     3C Qdrant Top-10
+          |
+          v
+     3C BGE Reranker Top-3
+          |
+          +-- insufficient ----------------> existing LOW/HIGH fallback
+          |
+          +-- sufficient
+                  |
+                  v
+             LOCAL-RAG
+                  |
+                  v
+          Ollama / local SLM
+```
+
+### Phase 3D behavior
+
+* Uses the existing `OllamaStreamClient`; no second Ollama transport is introduced.
+* `LOCAL-RAG` is selected only when 3B classifies the query as `LOCAL_KB` and the
+  3C reranker passes the configured `RERANK_RELEVANCE_THRESHOLD` (0.70 by default).
+* The local model receives only the selected Top-3 context plus the user question.
+* The grounding prompt explicitly forbids outside knowledge and instructs the
+  model to state when the supplied context is insufficient.
+* If local generation is unavailable, the request falls back to the existing
+  LOW/HIGH routing path.
+* Existing `force_tier`, authentication, policy enforcement, cache, usage
+  metering, logging, and SSE streaming remain in place.
+* Local RAG has zero configured model cost by default and is recorded as
+  `LOCAL-RAG` in request/usage logs.
+
+### Configuration
+
+```dotenv
+ENABLE_MVP3D_RAG=true
+LOCAL_RAG_MODEL=qwen2.5:1.5b
+LOCAL_RAG_TEMPERATURE=0.2
+```
+
+Set `ENABLE_MVP3D_RAG=false` to keep the Phase 3B/3C retrieval path but use the
+existing LOW/HIGH generation behavior.

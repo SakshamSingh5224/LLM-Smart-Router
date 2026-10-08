@@ -46,6 +46,9 @@ class GatewaySettings:
     reranker_max_length: int = 512
     rerank_relevance_threshold: float = 0.70
     enable_mvp3_retrieval: bool = True
+    enable_mvp3d_rag: bool = True
+    local_rag_model: str = "qwen2.5:1.5b"
+    local_rag_temperature: float = 0.2
 
     def __post_init__(self):
         override = os.getenv("GATEWAY_LOG_PATH")
@@ -93,4 +96,7 @@ def load_gateway_settings() -> GatewaySettings:
         reranker_max_length=int(e("RERANKER_MAX_LENGTH", "512")),
         rerank_relevance_threshold=float(e("RERANK_RELEVANCE_THRESHOLD", "0.70")),
         enable_mvp3_retrieval=e("ENABLE_MVP3_RETRIEVAL", "true").lower() in ("1", "true", "yes"),
+        enable_mvp3d_rag=e("ENABLE_MVP3D_RAG", "true").lower() in ("1", "true", "yes"),
+        local_rag_model=e("LOCAL_RAG_MODEL", e("LOW_MODEL", "qwen2.5:1.5b")),
+        local_rag_temperature=float(e("LOCAL_RAG_TEMPERATURE", "0.2")),
     )

@@ -26,7 +26,10 @@ from gateway.logging_utils import JsonlLogger, RequestLog, now_id
 from gateway.router_loader import load_router
 from gateway.security import make_guard
 from gateway.settings import load_gateway_settings
-from gateway.tier_clients import StreamChunk, collect_stream, make_high_stream_client, make_low_stream_client
+from gateway.tier_clients import (
+    OllamaStreamClient, StreamChunk, collect_stream, make_high_stream_client, make_low_stream_client,
+)
+from gateway.rag_client import LOCAL_RAG, LocalRagClient, RagRequest
 from smartrouter.labels import HIGH, LOW
 
 from gateway.db import database as db_module
@@ -51,6 +54,7 @@ retrieval_pipeline = RetrievalPipeline()
 
 low_client = make_low_stream_client(cfg.model)
 high_client = make_high_stream_client(cfg.model)
+local_rag_client = LocalRagClient(OllamaStreamClient(cfg.model.ollama_host, cfg.local_rag_model))
 cache = ResponseCache(cfg.cache_size, cfg.cache_ttl_s) if cfg.cache_enabled else None
 jlog = JsonlLogger(cfg.log_path)
 _http = httpx.AsyncClient(timeout=cfg.router_timeout_s)
@@ -344,8 +348,32 @@ def tier_client(tier: str):
     return low_client if tier == LOW else high_client
 
 def cost_of(tier: str, tokens_est: int) -> float:
+    if tier == LOCAL_RAG:
+        return 0.0
     rate = cfg.cost_per_1k_low if tier == LOW else cfg.cost_per_1k_high
     return round(rate * tokens_est / 1000.0, 6)
+
+
+def _local_rag_decision(mode: str, retrieval_result) -> dict:
+    return {
+        "tier": LOCAL_RAG,
+        "p_strong": 0.0,
+        "threshold": retrieval_result.threshold,
+        "confidence": retrieval_result.best_score,
+        "mode": mode,
+        "source": "local_rag",
+        "reasoning": (
+            f"3B LOCAL_KB intent + 3C sufficient context "
+            f"(rerank={retrieval_result.best_score:.3f} >= {retrieval_result.threshold:.3f})"
+        ),
+        "signals": [],
+    }
+
+
+def _external_decision(decision: dict, *, reason: str) -> dict:
+    out = dict(decision)
+    out["reasoning"] = f"{out.get('reasoning') or ''} | {reason}".strip(" |")
+    return out
 
 def _log_and_finish(request_id, query, decision, cache_hit, router_ms, gen_ms, ttft_ms, t_start, tokens_est, err=None):
     total_ms = (time.perf_counter() - t_start) * 1000
@@ -380,28 +408,45 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
 
-    # 2. Phase 3B & 3C: Intent Routing & Local Retrieval
+    # 2. Phase 3B/3C/3D: intent, retrieval, reranking, then grounded local generation.
     augmented_query = req.query
+    local_rag_result = None
+    local_rag_context = ""
+    intent_decision = None
     if cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
         intent_decision = judge.classify_intent(req.query)
         if intent_decision.route == "LOCAL_KB":
-            retrieval_result = retrieval_pipeline.run(req.query)
-            context = retrieval_result.context if retrieval_result.sufficient else ""
-            if context:
+            local_rag_result = retrieval_pipeline.run(req.query)
+            local_rag_context = local_rag_result.context if local_rag_result.sufficient else ""
+            if local_rag_context:
                 augmented_query = (
                     "Use the following verified context to answer the question.\n\n"
-                    f"Context:\n{context}\n\n"
+                    f"Context:\n{local_rag_context}\n\n"
                     f"Question: {req.query}"
                 )
 
-    # 3. Routing (Bypass if downgraded)
-    if policy_decision.is_downgraded:
-        decision = {"tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0, 
-                    "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason}
+    # 3. Routing. A sufficiently grounded 3C result becomes LOCAL-RAG before any
+    # external router/model is called. Explicit force_tier remains authoritative.
+    use_local_rag = (
+        cfg.enable_mvp3d_rag
+        and req.force_tier is None
+        and not policy_decision.is_downgraded
+        and intent_decision is not None
+        and intent_decision.route == "LOCAL_KB"
+        and local_rag_result is not None
+        and local_rag_result.sufficient
+        and bool(local_rag_context)
+    )
+    if use_local_rag:
+        decision = _local_rag_decision(mode, local_rag_result)
+        router_ms = intent_decision.latency_ms + local_rag_result.latency_ms
+        tier = LOCAL_RAG
+    elif policy_decision.is_downgraded:
+        decision = {"tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0,
+                    "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason, "signals": []}
         router_ms = 0.0
         tier = LOW
     else:
-        # Note: External router still evaluates the original query to determine tier
         decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
         tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
 
@@ -418,11 +463,27 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
                                 total_latency_ms=round(total, 1), tokens_est=0, est_cost_usd=0.0,
                                 downgraded=policy_decision.is_downgraded)
 
-    client = tier_client(tier)
-    # Inject the augmented query containing retrieved context directly to the LLM
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
-    stats = await collect_stream(client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens))
-    
+    if tier == LOCAL_RAG:
+        stats = await local_rag_client.generate(
+            RagRequest(req.query, local_rag_context),
+            max_tokens=req.max_tokens or cfg.max_tokens,
+            temperature=cfg.local_rag_temperature,
+        )
+        if stats.error:
+            # Local generation is an optimization, not a hard dependency. Fall back
+            # to the existing router/external path without changing LOW/HIGH semantics.
+            fallback_decision, fallback_router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
+            tier = req.force_tier if req.force_tier in (LOW, HIGH) else fallback_decision["tier"]
+            decision = _external_decision(fallback_decision, reason="LOCAL-RAG generation failed; used external fallback")
+            router_ms += fallback_router_ms
+            client = tier_client(tier)
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
+            stats = await collect_stream(client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens))
+    else:
+        client = tier_client(tier)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
+        stats = await collect_stream(client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens))
+
     if stats.error:
         _log_and_finish(request_id, req.query, decision, False, router_ms, stats.latency_ms, None, t0, 0, stats.error)
         raise HTTPException(status_code=502, detail=f"{tier} tier error: {stats.error}")
@@ -448,7 +509,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
     t0 = time.perf_counter()
     request_id = now_id()
     mode = req.mode or cfg.router_mode
-    
+
     # 1. Policy Evaluation
     policy_engine = PolicyEngine(db)
     policy_decision = policy_engine.evaluate(current_user.id)
@@ -456,24 +517,44 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
 
-    # 2. Phase 3B & 3C: Intent Routing & Local Retrieval
+    # 2. Phase 3B/3C/3D: intent, retrieval, reranking, then grounded local generation.
     augmented_query = req.query
+    local_rag_result = None
+    local_rag_context = ""
+    intent_decision = None
     if cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
         intent_decision = judge.classify_intent(req.query)
         if intent_decision.route == "LOCAL_KB":
-            retrieval_result = retrieval_pipeline.run(req.query)
-            context = retrieval_result.context if retrieval_result.sufficient else ""
-            if context:
+            local_rag_result = retrieval_pipeline.run(req.query)
+            local_rag_context = local_rag_result.context if local_rag_result.sufficient else ""
+            if local_rag_context:
                 augmented_query = (
                     "Use the following verified context to answer the question.\n\n"
-                    f"Context:\n{context}\n\n"
+                    f"Context:\n{local_rag_context}\n\n"
                     f"Question: {req.query}"
                 )
 
-    # 3. Routing (Bypass if downgraded)
-    if policy_decision.is_downgraded:
-        decision = {"tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0, 
-                    "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason}
+    # 3. A sufficiently grounded 3C result becomes LOCAL-RAG before any external
+    # router/model is called. Explicit force_tier and policy downgrade remain authoritative.
+    use_local_rag = (
+        cfg.enable_mvp3d_rag
+        and req.force_tier is None
+        and not policy_decision.is_downgraded
+        and intent_decision is not None
+        and intent_decision.route == "LOCAL_KB"
+        and local_rag_result is not None
+        and local_rag_result.sufficient
+        and bool(local_rag_context)
+    )
+    if use_local_rag:
+        decision = _local_rag_decision(mode, local_rag_result)
+        router_ms = intent_decision.latency_ms + local_rag_result.latency_ms
+        tier = LOCAL_RAG
+    elif policy_decision.is_downgraded:
+        decision = {
+            "tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0,
+            "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason, "signals": [],
+        }
         router_ms = 0.0
         tier = LOW
     else:
@@ -481,21 +562,77 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
 
     async def gen() -> AsyncIterator[bytes]:
+        nonlocal decision, tier, router_ms
+
         def sse(event: str, data: dict) -> bytes:
             return f"event: {event}\ndata: {json.dumps(data)}\n\n".encode()
 
-        yield sse("meta", {"request_id": request_id, "decision": decision, "cache_hit": False,
-                           "router_latency_ms": round(router_ms, 1), "downgraded": policy_decision.is_downgraded})
+        yield sse("meta", {
+            "request_id": request_id,
+            "decision": decision,
+            "cache_hit": False,
+            "router_latency_ms": round(router_ms, 1),
+            "downgraded": policy_decision.is_downgraded,
+        })
 
-        client = tier_client(tier)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
-        text_parts, ttft_ms, gen_t0, err = [], None, time.perf_counter(), None
-        
-        async for chunk in client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens):
-            if isinstance(chunk, StreamChunk) and chunk.error:
+        text_parts: list[str] = []
+        ttft_ms = None
+        gen_t0 = time.perf_counter()
+        err = None
+
+        if tier == LOCAL_RAG:
+            stream_client = local_rag_client.stream(
+                RagRequest(req.query, local_rag_context),
+                max_tokens=req.max_tokens or cfg.max_tokens,
+                temperature=cfg.local_rag_temperature,
+            )
+        else:
+            client = tier_client(tier)
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
+            stream_client = client.stream_chat(messages, max_tokens=req.max_tokens or cfg.max_tokens)
+
+        async for chunk in stream_client:
+            if chunk.error:
                 err = chunk.error
+                if tier == LOCAL_RAG:
+                    # Local RAG is an optimization, not a hard dependency.
+                    fallback_decision, fallback_router_ms = await get_decision(
+                        req.query, mode, req.threshold, req.explain
+                    )
+                    fallback_tier = req.force_tier if req.force_tier in (LOW, HIGH) else fallback_decision["tier"]
+                    decision = _external_decision(
+                        fallback_decision,
+                        reason="LOCAL-RAG unavailable; used external fallback",
+                    )
+                    tier = fallback_tier
+                    router_ms += fallback_router_ms
+                    yield sse("fallback", {"from": LOCAL_RAG, "to": tier, "reason": err})
+
+                    text_parts = []
+                    ttft_ms = None
+                    gen_t0 = time.perf_counter()
+                    err = None
+                    client = tier_client(tier)
+                    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
+                    async for fallback_chunk in client.stream_chat(
+                        messages, max_tokens=req.max_tokens or cfg.max_tokens
+                    ):
+                        if fallback_chunk.error:
+                            err = fallback_chunk.error
+                            yield sse("error", {"message": err})
+                            break
+                        if fallback_chunk.delta:
+                            if ttft_ms is None:
+                                ttft_ms = (time.perf_counter() - gen_t0) * 1000
+                            text_parts.append(fallback_chunk.delta)
+                            yield sse("delta", {"text": fallback_chunk.delta})
+                        if fallback_chunk.done:
+                            break
+                    break
+
                 yield sse("error", {"message": err})
                 break
+
             if chunk.delta:
                 if ttft_ms is None:
                     ttft_ms = (time.perf_counter() - gen_t0) * 1000
@@ -503,7 +640,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                 yield sse("delta", {"text": chunk.delta})
             if chunk.done:
                 break
-                
+
         gen_ms = (time.perf_counter() - gen_t0) * 1000
         full_text = "".join(text_parts)
         tokens_est = max(1, len(full_text) // 4) if full_text else 0
@@ -512,11 +649,25 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         if not err:
             with db_module.SessionLocal() as record_db:
                 usage_engine = PolicyEngine(record_db)
-                usage_engine.record_usage(current_user.id, tier, tokens_est, cost, policy_decision.is_downgraded)
+                usage_engine.record_usage(
+                    current_user.id, tier, tokens_est, cost, policy_decision.is_downgraded
+                )
 
-        total = _log_and_finish(request_id, req.query, decision, False, router_ms, gen_ms, ttft_ms, t0, tokens_est, err)
-        yield sse("done", {"total_latency_ms": round(total, 1), "cache_hit": False, "tokens_est": tokens_est,
-                           "est_cost_usd": cost, "ttft_ms": round(ttft_ms, 1) if ttft_ms else None})
+        total = _log_and_finish(
+            request_id, req.query, decision, False, router_ms, gen_ms,
+            ttft_ms, t0, tokens_est, err,
+        )
+        yield sse("done", {
+            "total_latency_ms": round(total, 1),
+            "cache_hit": False,
+            "tokens_est": tokens_est,
+            "est_cost_usd": cost,
+            "ttft_ms": round(ttft_ms, 1) if ttft_ms else None,
+            "tier": tier,
+        })
 
-    return StreamingResponse(gen(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
