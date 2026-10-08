@@ -35,7 +35,7 @@ from gateway.db.models import User, Policy, UserPolicy, RefreshToken
 from gateway.auth import get_password_hash, verify_password, create_access_token, get_current_user, create_refresh_token, hash_token
 from gateway.policy import PolicyEngine
 from gateway.judge import QueryJudge
-from gateway.retriever import LocalRetriever
+from gateway.reranker import RetrievalPipeline
 
 db_module.Base.metadata.create_all(bind=db_module.engine)
 
@@ -47,7 +47,7 @@ router, router_status = load_router(cfg.router_artifact_path)
 log.info("Router status: %s", router_status)
 
 judge = QueryJudge()
-retriever = LocalRetriever()
+retrieval_pipeline = RetrievalPipeline()
 
 low_client = make_low_stream_client(cfg.model)
 high_client = make_high_stream_client(cfg.model)
@@ -382,10 +382,11 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
 
     # 2. Phase 3B & 3C: Intent Routing & Local Retrieval
     augmented_query = req.query
-    if cfg.enable_mvp3_routing:
+    if cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
         intent_decision = judge.classify_intent(req.query)
         if intent_decision.route == "LOCAL_KB":
-            context = retriever.search(req.query)
+            retrieval_result = retrieval_pipeline.run(req.query)
+            context = retrieval_result.context if retrieval_result.sufficient else ""
             if context:
                 augmented_query = (
                     "Use the following verified context to answer the question.\n\n"
@@ -457,10 +458,11 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
 
     # 2. Phase 3B & 3C: Intent Routing & Local Retrieval
     augmented_query = req.query
-    if cfg.enable_mvp3_routing:
+    if cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
         intent_decision = judge.classify_intent(req.query)
         if intent_decision.route == "LOCAL_KB":
-            context = retriever.search(req.query)
+            retrieval_result = retrieval_pipeline.run(req.query)
+            context = retrieval_result.context if retrieval_result.sufficient else ""
             if context:
                 augmented_query = (
                     "Use the following verified context to answer the question.\n\n"
