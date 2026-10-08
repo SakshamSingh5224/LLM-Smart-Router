@@ -47,3 +47,10 @@ migrate-stamp:  ## mark an EXISTING database (tables already created by create_a
 all-phase1: data verify bench eval
 
 all-phase2: train-router eval-router
+
+.PHONY: mvp3c-test mvp3c-calibrate
+mvp3c-test:
+	PYTHONPATH=. $(PY) -m scripts.test_mvp3c "$(QUERY)"
+
+mvp3c-calibrate:
+	PYTHONPATH=. $(PY) -m scripts.calibrate_mvp3c
