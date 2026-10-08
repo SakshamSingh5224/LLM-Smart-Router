@@ -383,3 +383,62 @@ LOCAL_RAG_TEMPERATURE=0.2
 
 Set `ENABLE_MVP3D_RAG=false` to keep the Phase 3B/3C retrieval path but use the
 existing LOW/HIGH generation behavior.
+
+
+### Phase 3E — Redis Semantic Cache (Completed)
+
+Phase 3E adds a Redis-backed semantic cache in front of the expensive LOCAL-KB
+retrieval/reranking/generation path.
+
+```text
+User Query
+ |
+ v
+[3B Judge Model]
+ |
+ +-- LOCAL_KB --> [Redis Semantic Cache, cosine >= 0.92]
+ |                    |
+ |              HIT --+--> return cached LOCAL-RAG answer (cost = 0)
+ |                    |
+ |                  MISS
+ |                    v
+ |              [Qdrant Top-10]
+ |                    v
+ |              [CrossEncoder Top-3]
+ |                    v
+ |              [Ollama Local RAG]
+ |                    v
+ |              [Redis SET + TTL]
+ |
+ +-- non-LOCAL_KB --> existing LOW/HIGH routing path
+```
+
+The semantic cache uses the same `BAAI/bge-small-en-v1.5` embedding model as
+Phase 3C. Entries store the original query, embedding, answer, LOCAL-RAG route
+decision, and creation timestamp. Redis `EXPIRE` enforces the configured TTL
+(`GATEWAY_CACHE_TTL_S`, 3600 seconds by default). The initial semantic hit
+threshold is `SEMANTIC_CACHE_THRESHOLD=0.92`.
+
+Redis is deliberately fail-open: if Redis is unavailable, the request continues
+through the normal 3C retrieval + 3D generation path. Existing normalized exact
+caching for LOW/HIGH traffic is retained.
+
+Local development:
+
+```bash
+# Start Qdrant + Redis
+docker compose -f docker/docker-compose.mvp3.yml up -d
+
+# Verify Redis
+redis-cli ping
+
+# Gateway settings
+REDIS_URL=redis://localhost:6379/0
+SEMANTIC_CACHE_ENABLED=true
+SEMANTIC_CACHE_THRESHOLD=0.92
+```
+
+The cache exposes Prometheus counters for semantic hits, misses, unavailable
+events, writes, and invalidations. `ResponseCache.invalidate()` supports exact
+query invalidation or clearing a mode/all semantic entries for operational
+tests.

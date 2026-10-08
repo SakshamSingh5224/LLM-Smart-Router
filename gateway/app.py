@@ -55,7 +55,25 @@ retrieval_pipeline = RetrievalPipeline()
 low_client = make_low_stream_client(cfg.model)
 high_client = make_high_stream_client(cfg.model)
 local_rag_client = LocalRagClient(OllamaStreamClient(cfg.model.ollama_host, cfg.local_rag_model))
-cache = ResponseCache(cfg.cache_size, cfg.cache_ttl_s) if cfg.cache_enabled else None
+cache = (
+    ResponseCache(
+        cfg.cache_size,
+        cfg.cache_ttl_s,
+        redis_url=cfg.redis_url,
+        semantic_enabled=cfg.semantic_cache_enabled,
+        semantic_threshold=cfg.semantic_cache_threshold,
+        embedding_model=cfg.embedding_model,
+    )
+    if cfg.cache_enabled
+    else None
+)
+
+# Phase 3E: warm the semantic embedding model before the gateway
+# starts serving requests. This keeps model initialization out of
+# semantic-cache hit latency.
+if cache is not None and cfg.semantic_cache_enabled:
+    cache.warm_semantic_model()
+
 jlog = JsonlLogger(cfg.log_path)
 _http = httpx.AsyncClient(timeout=cfg.router_timeout_s)
 
@@ -408,13 +426,56 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
 
-    # 2. Phase 3B/3C/3D: intent, retrieval, reranking, then grounded local generation.
+    # 2. Phase 3E: semantic cache is checked before the 3B intent judge.
+    # Policy evaluation remains authoritative. A semantic hit contains the
+    # original LOCAL-RAG decision, so 3B/3C/3D can all be skipped.
     augmented_query = req.query
     local_rag_result = None
     local_rag_context = ""
     intent_decision = None
+    cache_hit = False
+    semantic_hit = None
+    tier = LOCAL_RAG
+    router_ms = 0.0
+
+    local_cache_allowed = (
+        cache is not None
+        and req.use_cache
+        and cfg.semantic_cache_enabled
+        and cfg.enable_mvp3d_rag
+        and req.force_tier is None
+        and not policy_decision.is_downgraded
+    )
+
+    if local_cache_allowed:
+        semantic_hit = cache.semantic_get(req.query, mode)
+        if semantic_hit and semantic_hit.decision:
+            decision = semantic_hit.decision
+            cache_hit = True
+            router_ms = 0.0
+            total = _log_and_finish(
+                request_id, req.query, decision, True, router_ms, 0.0,
+                None, t0, 0,
+            )
+            return ChatResponse(
+                request_id=request_id,
+                answer=semantic_hit.answer,
+                decision=RouteDecisionOut(**{
+                    k: decision[k] for k in RouteDecisionOut.model_fields
+                }),
+                cache_hit=True,
+                router_latency_ms=0.0,
+                generation_latency_ms=0.0,
+                total_latency_ms=round(total, 1),
+                tokens_est=0,
+                est_cost_usd=0.0,
+                downgraded=False,
+            )
+
+    # Cache miss: preserve the existing 3B -> 3C -> 3D path.
     if cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
         intent_decision = judge.classify_intent(req.query)
+
         if intent_decision.route == "LOCAL_KB":
             local_rag_result = retrieval_pipeline.run(req.query)
             local_rag_context = local_rag_result.context if local_rag_result.sufficient else ""
@@ -450,18 +511,29 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
         decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
         tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
 
-    # 4. Cache & Generation
-    cache_hit = False
-    if cache and req.use_cache:
-        # Cache keyed strictly on the original short query
+    # 4. Existing exact cache remains in place for non-semantic/external traffic.
+    if cache and req.use_cache and tier != LOCAL_RAG:
         hit = cache.get(req.query, mode)
         if hit:
-            total = _log_and_finish(request_id, req.query, decision, True, router_ms, 0.0, None, t0, 0)
-            return ChatResponse(request_id=request_id, answer=hit.answer,
-                                decision=RouteDecisionOut(**{k: decision[k] for k in RouteDecisionOut.model_fields}),
-                                cache_hit=True, router_latency_ms=round(router_ms, 1), generation_latency_ms=0.0,
-                                total_latency_ms=round(total, 1), tokens_est=0, est_cost_usd=0.0,
-                                downgraded=policy_decision.is_downgraded)
+            decision_for_hit = hit.decision or decision
+            total = _log_and_finish(
+                request_id, req.query, decision_for_hit, True, router_ms, 0.0,
+                None, t0, 0,
+            )
+            return ChatResponse(
+                request_id=request_id,
+                answer=hit.answer,
+                decision=RouteDecisionOut(**{
+                    k: decision_for_hit[k] for k in RouteDecisionOut.model_fields
+                }),
+                cache_hit=True,
+                router_latency_ms=round(router_ms, 1),
+                generation_latency_ms=0.0,
+                total_latency_ms=round(total, 1),
+                tokens_est=0,
+                est_cost_usd=0.0,
+                downgraded=policy_decision.is_downgraded,
+            )
 
     if tier == LOCAL_RAG:
         stats = await local_rag_client.generate(
@@ -493,7 +565,7 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
     policy_engine.record_usage(current_user.id, tier, stats.tokens_est, cost, policy_decision.is_downgraded)
     
     if cache and req.use_cache:
-        cache.put(req.query, mode, stats.text, tier, decision["p_strong"])
+        cache.put(req.query, mode, stats.text, tier, decision["p_strong"], decision=decision)
         
     total = _log_and_finish(request_id, req.query, decision, False, router_ms, stats.latency_ms, stats.ttft_ms, t0, stats.tokens_est)
     return ChatResponse(
@@ -517,13 +589,37 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
 
-    # 2. Phase 3B/3C/3D: intent, retrieval, reranking, then grounded local generation.
+    # 2. Phase 3E: semantic cache is checked before the 3B intent judge.
+    # Policy evaluation remains authoritative. A semantic hit skips 3B/3C/3D.
     augmented_query = req.query
     local_rag_result = None
     local_rag_context = ""
     intent_decision = None
-    if cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
+    cache_hit = False
+    semantic_hit = None
+    tier = LOCAL_RAG
+    router_ms = 0.0
+
+    local_cache_allowed = (
+        cache is not None
+        and req.use_cache
+        and cfg.semantic_cache_enabled
+        and cfg.enable_mvp3d_rag
+        and req.force_tier is None
+        and not policy_decision.is_downgraded
+    )
+
+    if local_cache_allowed:
+        semantic_hit = cache.semantic_get(req.query, mode)
+        if semantic_hit and semantic_hit.decision:
+            decision = semantic_hit.decision
+            cache_hit = True
+            router_ms = 0.0
+
+    # Cache miss: preserve the existing 3B -> 3C -> 3D path.
+    if not cache_hit and cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
         intent_decision = judge.classify_intent(req.query)
+
         if intent_decision.route == "LOCAL_KB":
             local_rag_result = retrieval_pipeline.run(req.query)
             local_rag_context = local_rag_result.context if local_rag_result.sufficient else ""
@@ -536,30 +632,40 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
 
     # 3. A sufficiently grounded 3C result becomes LOCAL-RAG before any external
     # router/model is called. Explicit force_tier and policy downgrade remain authoritative.
-    use_local_rag = (
-        cfg.enable_mvp3d_rag
-        and req.force_tier is None
-        and not policy_decision.is_downgraded
-        and intent_decision is not None
-        and intent_decision.route == "LOCAL_KB"
-        and local_rag_result is not None
-        and local_rag_result.sufficient
-        and bool(local_rag_context)
-    )
-    if use_local_rag:
-        decision = _local_rag_decision(mode, local_rag_result)
-        router_ms = intent_decision.latency_ms + local_rag_result.latency_ms
-        tier = LOCAL_RAG
-    elif policy_decision.is_downgraded:
-        decision = {
-            "tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0,
-            "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason, "signals": [],
-        }
-        router_ms = 0.0
-        tier = LOW
-    else:
-        decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
-        tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
+    if not cache_hit:
+        use_local_rag = (
+            cfg.enable_mvp3d_rag
+            and req.force_tier is None
+            and not policy_decision.is_downgraded
+            and intent_decision is not None
+            and intent_decision.route == "LOCAL_KB"
+            and local_rag_result is not None
+            and local_rag_result.sufficient
+            and bool(local_rag_context)
+        )
+        if use_local_rag:
+            decision = _local_rag_decision(mode, local_rag_result)
+            router_ms = intent_decision.latency_ms + local_rag_result.latency_ms
+            tier = LOCAL_RAG
+        elif policy_decision.is_downgraded:
+            decision = {
+                "tier": LOW, "p_strong": 0.0, "threshold": 0.0, "confidence": 1.0,
+                "mode": mode, "source": "policy_engine", "reasoning": policy_decision.reason, "signals": [],
+            }
+            router_ms = 0.0
+            tier = LOW
+        else:
+            decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
+            tier = req.force_tier if req.force_tier in (LOW, HIGH) else decision["tier"]
+
+        # Existing exact cache is retained for LOW/HIGH traffic.
+        if cache and req.use_cache and tier != LOCAL_RAG:
+            hit = cache.get(req.query, mode)
+            if hit:
+                decision = hit.decision or decision
+                cache_hit = True
+                # Exact cache hit uses the same streaming fast path below.
+                semantic_hit = hit
 
     async def gen() -> AsyncIterator[bytes]:
         nonlocal decision, tier, router_ms
@@ -570,12 +676,31 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         yield sse("meta", {
             "request_id": request_id,
             "decision": decision,
-            "cache_hit": False,
+            "cache_hit": cache_hit,
             "router_latency_ms": round(router_ms, 1),
             "downgraded": policy_decision.is_downgraded,
         })
 
         text_parts: list[str] = []
+        if cache_hit and semantic_hit is not None:
+            cached_text = semantic_hit.answer
+            if cached_text:
+                text_parts.append(cached_text)
+                yield sse("delta", {"text": cached_text})
+            total = _log_and_finish(
+                request_id, req.query, decision, True, router_ms, 0.0,
+                0.0, t0, 0,
+            )
+            yield sse("done", {
+                "total_latency_ms": round(total, 1),
+                "cache_hit": True,
+                "tokens_est": 0,
+                "est_cost_usd": 0.0,
+                "ttft_ms": 0.0,
+                "tier": tier,
+            })
+            return
+
         ttft_ms = None
         gen_t0 = time.perf_counter()
         err = None
@@ -652,6 +777,8 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                 usage_engine.record_usage(
                     current_user.id, tier, tokens_est, cost, policy_decision.is_downgraded
                 )
+            if cache and req.use_cache:
+                cache.put(req.query, mode, full_text, tier, decision["p_strong"], decision=decision)
 
         total = _log_and_finish(
             request_id, req.query, decision, False, router_ms, gen_ms,
@@ -659,7 +786,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         )
         yield sse("done", {
             "total_latency_ms": round(total, 1),
-            "cache_hit": False,
+            "cache_hit": cache_hit,
             "tokens_est": tokens_est,
             "est_cost_usd": cost,
             "ttft_ms": round(ttft_ms, 1) if ttft_ms else None,

@@ -157,3 +157,109 @@ def test_local_rag_stream(gateway_client):
     assert "event: delta" in body
     assert "local grounded" in body
     assert "event: done" in body
+
+
+def test_local_rag_semantic_cache_hit_skips_retrieval(gateway_client):
+    client, gw, _ = gateway_client
+
+    from gateway.cache import CacheEntry
+
+    decision = {
+        "tier": LOCAL_RAG,
+        "p_strong": 0.0,
+        "threshold": 0.70,
+        "confidence": 0.91,
+        "mode": "balanced",
+        "source": "local_rag",
+        "reasoning": "cached grounded result",
+        "signals": [],
+    }
+
+    class FakeSemanticCache:
+        def semantic_get(self, query, mode):
+            assert query == "Tell me what Chandrayaan-3 is"
+            assert mode == "balanced"
+            return CacheEntry(
+                answer="cached local answer",
+                tier=LOCAL_RAG,
+                p_strong=0.0,
+                created_at=0.0,
+                decision=decision,
+                similarity=0.95,
+            )
+
+        def get(self, query, mode):
+            raise AssertionError("exact cache should not be consulted on LOCAL-RAG semantic hit")
+
+    old_cache = gw.cache
+    old_retrieval = gw.retrieval_pipeline
+    gw.cache = FakeSemanticCache()
+    gw.retrieval_pipeline = SimpleNamespace(
+        run=lambda q: (_ for _ in ()).throw(AssertionError("Qdrant/retrieval must be skipped on cache hit"))
+    )
+    try:
+        r = client.post(
+            "/api/chat",
+            json={"query": "Tell me what Chandrayaan-3 is", "use_cache": True},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["answer"] == "cached local answer"
+        assert body["cache_hit"] is True
+        assert body["decision"]["tier"] == LOCAL_RAG
+    finally:
+        gw.cache = old_cache
+        gw.retrieval_pipeline = old_retrieval
+
+
+def test_local_rag_stream_semantic_cache_hit_skips_retrieval(gateway_client):
+    client, gw, _ = gateway_client
+
+    from gateway.cache import CacheEntry
+
+    decision = {
+        "tier": LOCAL_RAG,
+        "p_strong": 0.0,
+        "threshold": 0.70,
+        "confidence": 0.91,
+        "mode": "balanced",
+        "source": "local_rag",
+        "reasoning": "cached grounded result",
+        "signals": [],
+    }
+
+    class FakeSemanticCache:
+        def semantic_get(self, query, mode):
+            return CacheEntry(
+                answer="cached stream answer",
+                tier=LOCAL_RAG,
+                p_strong=0.0,
+                created_at=0.0,
+                decision=decision,
+                similarity=0.96,
+            )
+
+        def get(self, query, mode):
+            raise AssertionError("exact cache should not be consulted on LOCAL-RAG semantic hit")
+
+    old_cache = gw.cache
+    old_retrieval = gw.retrieval_pipeline
+    gw.cache = FakeSemanticCache()
+    gw.retrieval_pipeline = SimpleNamespace(
+        run=lambda q: (_ for _ in ()).throw(AssertionError("retrieval must be skipped"))
+    )
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={"query": "What is Chandrayaan-3?", "use_cache": True},
+        ) as r:
+            body = "".join(r.iter_text())
+        assert "event: meta" in body
+        assert '"cache_hit": true' in body
+        assert "event: delta" in body
+        assert "cached stream answer" in body
+        assert "event: done" in body
+    finally:
+        gw.cache = old_cache
+        gw.retrieval_pipeline = old_retrieval

@@ -9,6 +9,15 @@
 # Stop:     docker compose -f docker/docker-compose.yml down
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: llm-router-redis
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    volumes:
+      - redis_storage:/data
+    command: ["redis-server", "--appendonly", "yes"]
+
   router_service:
     build:
       context: ..
@@ -23,26 +32,33 @@ services:
       context: ..
       dockerfile: docker/gateway.Dockerfile
     ports: ["8000:8000"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       # Talk to the router_service container over the compose network -
       # demonstrates the plan's "router scales independently of the gateway".
       ROUTER_SERVICE_URL: "http://router_service:8001"
-      LOW_PROVIDER: "${LOW_PROVIDER:-openai_compat}"
+      OLLAMA_HOST: "http://host.docker.internal:11434"
+      LOW_PROVIDER: "ollama"
       LOW_BASE_URL: "${LOW_BASE_URL:-https://api.groq.com/openai/v1}"
-      LOW_MODEL: "${LOW_MODEL:-openai/gpt-oss-20b}"
+      LOW_MODEL: "qwen2.5:1.5b"
       LOW_API_KEY: "${LOW_API_KEY:-${HIGH_API_KEY}}"
       HIGH_BASE_URL: "${HIGH_BASE_URL:-https://api.groq.com/openai/v1}"
       HIGH_MODEL: "${HIGH_MODEL:-openai/gpt-oss-120b}"
       HIGH_API_KEY: "${HIGH_API_KEY:?set HIGH_API_KEY in .env}"
       GATEWAY_API_KEY: "${GATEWAY_API_KEY:-}"
       GATEWAY_CORS_ORIGINS: "*"
+      REDIS_URL: "redis://redis:6379/0"
+      SEMANTIC_CACHE_ENABLED: "${SEMANTIC_CACHE_ENABLED:-true}"
+      SEMANTIC_CACHE_THRESHOLD: "${SEMANTIC_CACHE_THRESHOLD:-0.92}"
       # Added for Phase 4 load/chaos testing: without these, this container
       # silently falls back to SQLite (chokes under concurrent load-test writes)
       # and the default 30 req/min rate limit (dominates results at load-test
       # volume). Both still default sanely for normal local dev use.
       DATABASE_URL: "${DATABASE_URL:-}"
       GATEWAY_RATE_LIMIT_PER_MIN: "${GATEWAY_RATE_LIMIT_PER_MIN:-30}"
-    depends_on: [router_service]
+      QDRANT_URL: "http://qdrant:6333"
+    depends_on: [router_service, redis]
     restart: unless-stopped
 
   prometheus:
@@ -59,6 +75,10 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      QDRANT_URL: "http://qdrant:6333"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on: [prometheus]
+
+volumes:
+  redis_storage:

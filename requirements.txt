@@ -33,3 +33,6 @@ fastembed>=0.3
 
 # MVP 3C
 sentence-transformers>=3.0,<6
+
+# MVP 3E - Redis semantic cache
+redis>=5.0,<7
