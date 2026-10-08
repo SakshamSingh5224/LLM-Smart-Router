@@ -288,3 +288,38 @@ User Query
 4. Hallucination rate for Indian-context queries < 5%.
 
 
+
+
+## MVP 3C — Qdrant Retrieval + Re-ranking
+
+MVP 3C uses a two-stage local retrieval pipeline:
+
+```text
+Query
+  -> BAAI/bge-small-en-v1.5
+  -> Qdrant Top-10
+  -> BAAI/bge-reranker-base
+  -> Top-3 context
+  -> relevance gate (default 0.78)
+```
+
+Source metadata is retained with every selected chunk. Reranker latency and raw
+CrossEncoder scores are recorded separately from normalized 0–1 presentation
+scores. The normalized sigmoid value is **not a calibrated probability**.
+
+Run local validation after Qdrant is populated:
+
+```bash
+source .venv/bin/activate
+PYTHONPATH=. python -m scripts.test_mvp3c "What was the objective of Chandrayaan-3?"
+PYTHONPATH=. python -m scripts.calibrate_mvp3c
+pytest -q tests/test_mvp3_retriever.py
+```
+
+Calibration intentionally does not change the required 0.78 threshold automatically.
+It reports positive/negative score separation so the threshold can be defended or
+revised based on measured knowledge-base behavior.
+
+The exact `bge-reranker-base` pipeline is intended for local development. The
+Render Free deployment disables MVP 3C retrieval by default because the full
+reranker is not appropriate for a 512 MB service; Qdrant can remain external.
