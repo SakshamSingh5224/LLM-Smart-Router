@@ -1,49 +1,70 @@
-import sys
-import os
-import shutil
+import os, sys
 from pathlib import Path
 import pytest
 
-# 1. Set environment variables BEFORE importing gateway modules
-test_db_path = "./test_chroma_db"
-os.environ["GATEWAY_CHROMA_DB_DIR"] = test_db_path
-os.environ["RETRIEVAL_DISTANCE_THRESHOLD"] = "0.7"  # Tightened for all-MiniLM-L6-v2
+os.environ["QDRANT_URL"] = "http://test-qdrant"
+os.environ["QDRANT_COLLECTION"] = "test_collection"
+os.environ["RETRIEVAL_TOP_K"] = "10"
+os.environ["RERANK_TOP_K"] = "3"
+os.environ["RERANKER_CANDIDATE_K"] = "10"
+os.environ["RERANK_RELEVANCE_THRESHOLD"] = "0.78"
 
-# Add the project root to the Python path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from gateway.retriever import LocalRetriever
+from gateway.retriever import LocalRetriever, RetrievalResult, RetrievedChunk
+from gateway.reranker import LocalReranker
 
-@pytest.fixture(scope="session", autouse=True)
-def cleanup_after_all_tests():
-    yield
-    # Cleanup the test database only after all tests finish
-    shutil.rmtree(test_db_path, ignore_errors=True)
-
-@pytest.fixture(scope="module")
-def test_retriever():
-    retriever = LocalRetriever(collection_name="test_context")
-    retriever.collection.upsert(
-        documents=[
-            "ISRO launched Chandrayaan-3 on July 14, 2023.", 
-            "The Supreme Court of India is the highest judicial court."
-        ],
-        metadatas=[{"source": "isro"}, {"source": "sc"}],
-        ids=["doc1", "doc2"]
+def make_chunk(i: int, text: str) -> RetrievedChunk:
+    return RetrievedChunk(
+        id=f"id-{i}", text=text, dense_score=0.9 - i * 0.01,
+        source=f"source-{i}.pdf", filename=f"source-{i}.pdf",
+        category="isro", page=i + 1, chunk_index=i,
     )
-    return retriever
 
-def test_successful_retrieval(test_retriever):
-    context = test_retriever.search("When was Chandrayaan launched?")
-    assert "ISRO launched Chandrayaan-3" in context
-    assert "Supreme Court" not in context
+def test_retriever_config_is_top_10():
+    retriever = LocalRetriever()
+    assert retriever.cfg.retrieval_top_k == 10
+    assert retriever.cfg.qdrant_collection == "test_collection"
 
-def test_out_of_domain_retrieval(test_retriever):
-    # Irrelevant query should exceed distance threshold and return empty
-    context = test_retriever.search("What is the recipe for chocolate chip cookies?")
-    assert context == ""
+def test_empty_query_does_not_call_qdrant():
+    result = LocalRetriever().retrieve("   ")
+    assert result.candidates == []
+    assert result.latency_ms == 0.0
 
-def test_empty_query(test_retriever):
-    # Empty query should short-circuit and return empty
-    context = test_retriever.search("   ")
-    assert context == ""
+def test_reranker_selects_top_3_and_applies_threshold(monkeypatch):
+    reranker = LocalReranker()
+    class FakeModel:
+        def predict(self, pairs, show_progress_bar=False, batch_size=None):
+            return [4.0, 3.0, 2.0, 0.0, -1.0]
+    monkeypatch.setattr(reranker, "_model", FakeModel())
+    retrieval = RetrievalResult(
+        query="When did Chandrayaan-3 launch?",
+        candidates=[make_chunk(0, "Chandrayaan-3 launched on July 14, 2023."),
+                     make_chunk(1, "The mission demonstrated a soft landing."),
+                     make_chunk(2, "ISRO operated the mission."),
+                     make_chunk(3, "Unrelated context."),
+                     make_chunk(4, "Another unrelated context.")],
+        latency_ms=2.0,
+    )
+    result = reranker.rerank(retrieval.query, retrieval)
+    assert len(result.candidates) == 3
+    assert result.sufficient is True
+    assert result.best_score >= 0.78
+    assert result.sources[0]["source"] == "source-0.pdf"
+    assert result.sources[0]["rerank_raw_score"] == 4.0
+
+def test_reranker_marks_insufficient_context(monkeypatch):
+    reranker = LocalReranker()
+    class FakeModel:
+        def predict(self, pairs, show_progress_bar=False, batch_size=None):
+            return [-2.0] * len(pairs)
+    monkeypatch.setattr(reranker, "_model", FakeModel())
+    retrieval = RetrievalResult(
+        query="Unknown",
+        candidates=[make_chunk(i, f"chunk {i}") for i in range(10)],
+        latency_ms=1.0,
+    )
+    result = reranker.rerank("Unknown", retrieval)
+    assert len(result.candidates) == 3
+    assert result.sufficient is False
+    assert result.best_score < 0.78
