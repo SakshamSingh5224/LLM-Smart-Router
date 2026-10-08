@@ -268,7 +268,7 @@ User Query
 * **FR1 - Ingestion:** Extract, chunk (600 tokens/100 overlap), embed using `bge-small-en-v1.5`.
 * **FR2 - Judge Intelligence:** Label queries (`local_kb` or `external_llm`) based on keywords (ISRO, NCERT, SC, Budget, Chandrayaan).
 * **FR3 - Retrieval:** Retrieve Top 10, re-rank to Top 3 (`bge-reranker-base`).
-* **FR4 - Threshold:** If similarity < 0.78, fallback to external LLM. If > 0.78, answer from context.
+* **FR4 - Threshold:** If similarity < 0.70, fallback to external LLM. If > 0.70, answer from context.
 * **FR5 - Semantic Cache:** Redis caching (`query_embedding -> answer`, similarity > 0.92).
 * **FR6 - Dashboard:** Show logs for routing and cost savings.
 
@@ -300,7 +300,7 @@ Query
   -> Qdrant Top-10
   -> BAAI/bge-reranker-base
   -> Top-3 context
-  -> relevance gate (default 0.78)
+  -> relevance gate (default 0.70)
 ```
 
 Source metadata is retained with every selected chunk. Reranker latency and raw
@@ -316,7 +316,7 @@ PYTHONPATH=. python -m scripts.calibrate_mvp3c
 pytest -q tests/test_mvp3_retriever.py
 ```
 
-Calibration intentionally does not change the required 0.78 threshold automatically.
+Calibration established 0.70 as the empirical default for the current knowledge base.
 It reports positive/negative score separation so the threshold can be defended or
 revised based on measured knowledge-base behavior.
 

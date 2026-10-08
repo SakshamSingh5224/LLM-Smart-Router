@@ -31,4 +31,5 @@ qdrant-client>=1.12,<2
 pypdf>=5.0
 fastembed>=0.3
 
-# MVP 3C\nsentence-transformers>=3.0,<6\n
+# MVP 3C
+sentence-transformers>=3.0,<6
