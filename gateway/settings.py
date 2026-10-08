@@ -44,7 +44,7 @@ class GatewaySettings:
     reranker_candidate_k: int = 10
     rerank_top_k: int = 3
     reranker_max_length: int = 512
-    rerank_relevance_threshold: float = 0.78
+    rerank_relevance_threshold: float = 0.70
     enable_mvp3_retrieval: bool = True
 
     def __post_init__(self):
@@ -91,6 +91,6 @@ def load_gateway_settings() -> GatewaySettings:
         reranker_candidate_k=int(e("RERANKER_CANDIDATE_K", "10")),
         rerank_top_k=int(e("RERANK_TOP_K", "3")),
         reranker_max_length=int(e("RERANKER_MAX_LENGTH", "512")),
-        rerank_relevance_threshold=float(e("RERANK_RELEVANCE_THRESHOLD", "0.78")),
+        rerank_relevance_threshold=float(e("RERANK_RELEVANCE_THRESHOLD", "0.70")),
         enable_mvp3_retrieval=e("ENABLE_MVP3_RETRIEVAL", "true").lower() in ("1", "true", "yes"),
     )
