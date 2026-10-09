@@ -1,7 +1,7 @@
 // frontend/app.js
 
-// Ensure BACKEND_URL is available from config.js, or use a default
-const API_BASE = typeof BACKEND_URL !== 'undefined' ? BACKEND_URL : "https://llm-gateway-62xo.onrender.com";
+// Use the single API_BASE value shared by login and chat. Blank means same-origin.
+const API_BASE = (typeof window.API_BASE === "string" ? window.API_BASE : "").replace(/\/+$/, "");
 
 document.addEventListener("DOMContentLoaded", () => {
     // 1. Authentication Check
@@ -23,21 +23,68 @@ document.addEventListener("DOMContentLoaded", () => {
     // 3. Health Check
     async function checkHealth() {
         try {
-            const res = await fetch(`${API_BASE}/health`);
+            const res = await fetch(`${API_BASE}/health`, { cache: "no-store" });
+            if (!res.ok) throw new Error(`Health endpoint returned ${res.status}`);
             const data = await res.json();
             if (data.status === 'ok') {
                 healthIndicator.className = 'health ok';
-                healthIndicator.title = "Gateway / Router Status: OK";
+                healthIndicator.title = `Gateway status: OK (${API_BASE || "same origin"})`;
             } else {
                 healthIndicator.className = 'health degraded';
-                healthIndicator.title = "Gateway / Router Status: Degraded";
+                healthIndicator.title = "Gateway status: Degraded";
             }
         } catch (e) {
             healthIndicator.className = 'health down';
-            healthIndicator.title = "Gateway / Router Status: Down";
+            healthIndicator.title = `Gateway unreachable: ${e.message}`;
         }
     }
     checkHealth();
+
+    // Phase 3F: configuration status for the 3A-3E request path.
+    const systemBtn = document.getElementById('systemBtn');
+    const systemPanel = document.getElementById('systemPanel');
+    const systemContent = document.getElementById('systemContent');
+    if (systemBtn && systemPanel && systemContent) {
+        systemBtn.addEventListener('click', async () => {
+            systemPanel.classList.toggle('hidden');
+            if (systemPanel.classList.contains('hidden')) return;
+            systemContent.textContent = 'Checking gateway configuration…';
+            try {
+                const res = await fetch(`${API_BASE}/api/system/status`, { cache: 'no-store' });
+                if (!res.ok) throw new Error(`Status endpoint returned ${res.status}`);
+                const status = await res.json();
+                systemContent.replaceChildren();
+                const intro = document.createElement('p');
+                intro.className = 'usage-meta';
+                intro.textContent = 'Configuration flags only; a successful LOCAL-RAG response and cache-hit response verify the live request path.';
+                systemContent.appendChild(intro);
+                const phases = [
+                    ['3A · Qdrant configured', status.phase_3a?.qdrant_url_configured],
+                    ['3B · Intent routing enabled', status.phase_3b?.enabled],
+                    ['3C · Retrieval / reranking enabled', status.phase_3c?.enabled],
+                    ['3D · Local RAG enabled', status.phase_3d?.enabled],
+                    ['3E · Semantic cache enabled', status.phase_3e?.enabled]
+                ];
+                phases.forEach(([label, enabled]) => {
+                    const row = document.createElement('div');
+                    row.className = 'system-status-row';
+                    const name = document.createElement('span');
+                    name.textContent = label;
+                    const value = document.createElement('strong');
+                    value.className = enabled ? 'system-enabled' : 'system-disabled';
+                    value.textContent = enabled ? 'ENABLED / CONFIGURED' : 'DISABLED / NOT CONFIGURED';
+                    row.append(name, value);
+                    systemContent.appendChild(row);
+                });
+                const metrics = document.createElement('p');
+                metrics.className = 'usage-meta';
+                metrics.textContent = `Prometheus metrics: ${status.observability?.metrics_path || '/metrics'}`;
+                systemContent.appendChild(metrics);
+            } catch (err) {
+                systemContent.textContent = `Could not load system status: ${err.message}`;
+            }
+        });
+    }
 
     // 4. Input Handling (Shift+Enter for newline, Enter to send)
     queryInput.addEventListener('keydown', (e) => {
@@ -122,23 +169,49 @@ document.addEventListener("DOMContentLoaded", () => {
         const msgDiv = document.createElement('div');
         msgDiv.className = 'msg assistant';
 
-        // Extract backend keys based on gateway/app.py ChatResponse structure
+        // Phase 3F: surface gateway routing and observability fields in the UI.
         const decision = data.decision || {};
-        const routeDecision = decision.tier || 'LOW';
-        const pStrong = decision.p_strong ? decision.p_strong.toFixed(3) : '0.000';
-        const latency = data.router_latency_ms || 0;
-        const reasoning = decision.reasoning || '';
-        const answerText = data.answer || '';
+        const routeDecision = String(decision.tier || 'LOW');
+        const normalizedTier = routeDecision.toLowerCase();
+        const badgeClass = normalizedTier === 'high' ? 'high' :
+            (normalizedTier === 'local-rag' ? 'local-rag' : 'low');
+        const pStrong = Number.isFinite(Number(decision.p_strong)) ? Number(decision.p_strong).toFixed(3) : '—';
+        const confidence = Number.isFinite(Number(decision.confidence)) ? Number(decision.confidence).toFixed(3) : '—';
+        const latency = Number(data.router_latency_ms || 0);
+        const generationLatency = Number(data.generation_latency_ms || 0);
+        const totalLatency = Number(data.total_latency_ms || 0);
+        const cost = Number(data.est_cost_usd || 0);
+        const cacheLabel = data.cache_hit ? 'CACHE HIT' : 'CACHE MISS';
+        const source = String(decision.source || 'unknown');
+        const reasoning = String(decision.reasoning || '');
+        const answerText = String(data.answer || '');
 
-        // Build Metadata Header
-        const badgeClass = routeDecision.toLowerCase() === 'high' ? 'high' : 'low';
-        const metaHTML = `
-            <div class="meta">
-                <span class="tier-badge ${badgeClass}">${routeDecision.toUpperCase()}</span>
-                <span>p(strong)=${pStrong} mode=${currentMode} ${latency} ms</span>
-            </div>
-        `;
-        msgDiv.insertAdjacentHTML('beforeend', metaHTML);
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        const tierBadge = document.createElement('span');
+        tierBadge.className = `tier-badge ${badgeClass}`;
+        tierBadge.textContent = routeDecision.toUpperCase();
+        const routeStats = document.createElement('span');
+        routeStats.textContent = `p(strong)=${pStrong} · confidence=${confidence} · mode=${currentMode}`;
+        meta.append(tierBadge, routeStats);
+        msgDiv.appendChild(meta);
+
+        const telemetry = document.createElement('div');
+        telemetry.className = 'telemetry';
+        [
+            `Source: ${source}`,
+            cacheLabel,
+            `Router: ${latency.toFixed(1)} ms`,
+            `Generation: ${generationLatency.toFixed(1)} ms`,
+            `Total: ${totalLatency.toFixed(1)} ms`,
+            `Est. cost: $${cost.toFixed(6)}`
+        ].forEach((label) => {
+            const item = document.createElement('span');
+            item.textContent = label;
+            if (label === 'CACHE HIT') item.className = 'telemetry-hit';
+            telemetry.appendChild(item);
+        });
+        msgDiv.appendChild(telemetry);
 
         // Build Message Bubble
         const bubbleDiv = document.createElement('div');

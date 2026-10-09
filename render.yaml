@@ -13,6 +13,14 @@ services:
         value: ""
       - key: ENABLE_MVP3_RETRIEVAL
         value: "false"
+      # Render Free cannot reach the developer's localhost Ollama instance,
+      # and the local embedding model is too heavy for the 512 MB instance.
+      # Enable these only after provisioning reachable Qdrant/Redis/Ollama
+      # services and a host with sufficient memory.
+      - key: ENABLE_MVP3D_RAG
+        value: "false"
+      - key: SEMANTIC_CACHE_ENABLED
+        value: "false"
       - key: QDRANT_URL
         sync: false
       - key: QDRANT_API_KEY

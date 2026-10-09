@@ -442,3 +442,44 @@ The cache exposes Prometheus counters for semantic hits, misses, unavailable
 events, writes, and invalidations. `ResponseCache.invalidate()` supports exact
 query invalidation or clearing a mode/all semantic entries for operational
 tests.
+
+## Phase 3F — Gateway Integration & Observability (In Progress)
+
+Phase 3F makes the frontend and gateway use one API-base setting and exposes
+routing/cache telemetry in the chat UI.
+
+### Frontend → Gateway configuration
+
+`frontend/config.js` is the single source of truth for the gateway URL:
+
+```js
+window.API_BASE = "https://your-public-gateway.example.com";
+```
+
+For local development where the gateway serves the frontend from the same
+origin, set `window.API_BASE = ""`. The login and chat pages both use this
+setting; do not hard-code separate gateway URLs in `index.html` or `app.js`.
+
+Do not put `GATEWAY_API_KEY`, provider API keys, or other server secrets in
+frontend JavaScript: Vercel serves this file publicly. Protect API access with
+JWT authentication and server-side rate limiting, or add a server-side proxy
+if a private API key is required.
+
+### Request telemetry
+
+Each chat response displays the selected tier, source, routing confidence,
+cache hit/miss, router latency, generation latency, total latency, and estimated
+cost. The **System status** panel shows the configured feature flags for phases
+3A–3E. `GET /api/system/status` is intentionally a configuration report, not a
+live Qdrant/Redis/Ollama connectivity check. `/metrics` remains the Prometheus
+metrics endpoint.
+
+### Deployment constraint
+
+The checked-in Render Free configuration explicitly disables 3C retrieval,
+3D local generation, and 3E semantic caching. The full local reranker/embedding
+models and a developer machine's `localhost` Ollama service are not available
+to a remote Render instance by default. Do not mark cloud Local-RAG as live
+until Qdrant, Redis, and Ollama are reachable from the deployed gateway and a
+successful production request confirms `source=local_rag`; repeat a similar
+query and confirm `cache_hit=true` to validate 3E.

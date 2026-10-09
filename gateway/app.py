@@ -81,10 +81,10 @@ app = FastAPI(title="LLM Smart Router - Gateway", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=cfg.cors_origins,
+    allow_credentials=False,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
 )
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
@@ -411,6 +411,35 @@ def _log_and_finish(request_id, query, decision, cache_hit, router_ms, gen_ms, t
 async def health():
     ok = router_status["status"] == "ok" or cfg.router_service_url != ""
     return {"status": "ok" if ok else "degraded"}
+
+
+@app.get("/api/system/status")
+async def system_status():
+    """Non-secret feature configuration for the Phase 3F frontend status panel.
+
+    This reports configuration flags, not live reachability of Qdrant, Redis,
+    or Ollama. A successful LOCAL-RAG response / semantic-cache hit is the
+    runtime proof that those request paths worked.
+    """
+    return {
+        "gateway": "ok",
+        "phase_3a": {
+            "qdrant_url_configured": bool(cfg.qdrant_url),
+            "collection": cfg.qdrant_collection,
+        },
+        "phase_3b": {"enabled": bool(cfg.enable_mvp3_routing)},
+        "phase_3c": {"enabled": bool(cfg.enable_mvp3_retrieval)},
+        "phase_3d": {
+            "enabled": bool(cfg.enable_mvp3d_rag),
+            "model": cfg.local_rag_model,
+        },
+        "phase_3e": {
+            "enabled": bool(cache is not None and cfg.semantic_cache_enabled),
+            "threshold": cfg.semantic_cache_threshold,
+        },
+        "observability": {"metrics_path": "/metrics"},
+        "note": "Feature flags are configuration only, not dependency connectivity checks.",
+    }
 
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(api_guard)])
 async def chat(req: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):

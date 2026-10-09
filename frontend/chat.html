@@ -28,10 +28,20 @@
           <input type="checkbox" id="explain" checked /> explain routing
         </label>
         <button type="button" id="usageBtn" class="icon-btn">Usage</button>
+        <button type="button" id="systemBtn" class="icon-btn">System status</button>
         <button type="button" id="adminBtn" class="icon-btn" style="display:none">Admin</button>
         <span id="health" class="health ok" title="gateway / router status">●</span>
       </div>
     </header>
+
+    <!-- Phase 3F: Gateway configuration / phase status panel -->
+    <div id="systemPanel" class="side-panel hidden">
+      <div class="panel-header">
+        <h3>Gateway & Phase Status</h3>
+        <button type="button" class="panel-close" data-close="systemPanel">&times;</button>
+      </div>
+      <div id="systemContent" class="panel-body">Open to check configured phases.</div>
+    </div>
 
     <!-- Phase 2C: "my usage" panel (GET /api/me/usage) -->
     <div id="usagePanel" class="side-panel hidden">

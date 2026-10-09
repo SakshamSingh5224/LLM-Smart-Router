@@ -263,3 +263,18 @@ def test_local_rag_stream_semantic_cache_hit_skips_retrieval(gateway_client):
     finally:
         gw.cache = old_cache
         gw.retrieval_pipeline = old_retrieval
+
+
+def test_phase3f_system_status_endpoint(gateway_client):
+    client, _, _ = gateway_client
+    response = client.get("/api/system/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["gateway"] == "ok"
+    assert body["phase_3a"]["qdrant_url_configured"] is True
+    assert "enabled" in body["phase_3b"]
+    assert "enabled" in body["phase_3c"]
+    assert "enabled" in body["phase_3d"]
+    assert "enabled" in body["phase_3e"]
+    assert body["observability"]["metrics_path"] == "/metrics"
+    assert "not dependency connectivity checks" in body["note"]

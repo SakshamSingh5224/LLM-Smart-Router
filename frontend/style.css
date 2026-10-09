@@ -73,6 +73,14 @@ main#thread { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-dire
 .tier-badge { padding: 2px 8px; border-radius: 4px; font-weight: 700; font-size: 0.75rem; letter-spacing: .02em; }
 .tier-badge.low { background: var(--low-bg); color: var(--low-text); }
 .tier-badge.high { background: var(--high-bg); color: var(--high-text); }
+.tier-badge.local-rag { background: #153e36; color: #7ee7c1; }
+.telemetry { display: flex; flex-wrap: wrap; gap: 6px; font-size: 11px; color: var(--muted); }
+.telemetry span { border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
+.telemetry .telemetry-hit { color: #7ee7c1; border-color: #276b5b; font-weight: 700; }
+.system-status-row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.system-status-row strong { font-size: 11px; }
+.system-enabled { color: var(--low-text); }
+.system-disabled { color: var(--high-text); }
 .reasoning { font-size: 11px; color: var(--muted); font-style: italic; white-space: pre-line; margin-top: 4px; }
 
 /* Composer */
