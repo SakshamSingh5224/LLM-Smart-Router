@@ -16,6 +16,10 @@ if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
         # vanish on the next connection (e.g. a streaming response's background
         # task) -> "no such table: ..." errors. StaticPool shares one connection.
         _engine_kwargs["poolclass"] = StaticPool
+else:
+    # Neon/serverless Postgres may close idle pooled connections. Validate each
+    # checkout and recycle connections before long idle periods.
+    _engine_kwargs.update(pool_pre_ping=True, pool_recycle=300)
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args, **_engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

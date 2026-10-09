@@ -10,9 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-# Router service only needs the ML + web layer, not the dataset/embedding extras -
-# installing the full requirements.txt is simplest and still small (~200MB image).
+COPY docker/router-requirements.txt ./requirements.txt
+# Keep this image independent of large ingestion/data-science extras such as pyarrow.
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY smartrouter/ ./smartrouter/

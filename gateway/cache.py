@@ -14,7 +14,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock
 from typing import Any, Optional
 
@@ -60,6 +60,7 @@ class CacheEntry:
     created_at: float
     decision: Optional[dict[str, Any]] = None
     similarity: Optional[float] = None
+    sources: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -144,9 +145,13 @@ class ResponseCache:
         tier: str,
         p_strong: float,
         decision: Optional[dict[str, Any]] = None,
+        sources: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         key = self._key(query, mode)
-        entry = CacheEntry(answer, tier, p_strong, time.time(), decision=decision)
+        entry = CacheEntry(
+            answer, tier, p_strong, time.time(), decision=decision,
+            sources=list(sources or []),
+        )
         with self._lock:
             self._store[key] = entry
             self._store.move_to_end(key)
@@ -203,6 +208,7 @@ class ResponseCache:
             "tier": entry.tier,
             "p_strong": entry.p_strong,
             "decision": entry.decision or {},
+            "sources": entry.sources,
             "created_at": entry.created_at,
         }
 
@@ -239,6 +245,7 @@ class ResponseCache:
                             created_at=created_at,
                             decision=payload.get("decision") or None,
                             similarity=score,
+                            sources=payload.get("sources") or [],
                         )
                 except (TypeError, ValueError, json.JSONDecodeError, KeyError):
                     log.warning("Ignoring malformed semantic cache entry: %s", key)

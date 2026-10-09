@@ -24,7 +24,8 @@ def _result(sufficient=True):
         candidates=[SimpleNamespace(chunk=chunk, rerank_score=0.91, raw_score=2.3)],
         context="[Source: isro.pdf, page: 12]\nChandrayaan-3 launched on July 14, 2023." if sufficient else "",
         sufficient=sufficient, threshold=0.70, best_score=0.91 if sufficient else 0.50,
-        latency_ms=5.0,
+        latency_ms=5.0, retrieval_latency_ms=2.0,
+        sources=[{"source": "isro.pdf", "filename": "isro.pdf", "page": 12, "rerank_score": 0.91}],
     )
 
 
@@ -278,3 +279,64 @@ def test_phase3f_system_status_endpoint(gateway_client):
     assert "enabled" in body["phase_3e"]
     assert body["observability"]["metrics_path"] == "/metrics"
     assert "not dependency connectivity checks" in body["note"]
+
+
+
+def test_phase3f_metrics_endpoint_and_usage_ledger(gateway_client):
+    client, gw, _ = gateway_client
+    response = client.post(
+        "/api/chat",
+        json={"query": "When did Chandrayaan-3 launch?", "use_cache": False},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"]["tier"] == LOCAL_RAG
+    assert body["ttft_ms"] is not None
+    assert body["estimated_cost_avoided_usd"] >= 0
+    assert isinstance(body["sources"], list)
+
+    # The chat request uses a fresh session to persist usage after model work.
+    from gateway.db.models import UsageLedger
+    db = gw.db_module.SessionLocal()
+    try:
+        assert db.query(UsageLedger).count() >= 1
+    finally:
+        db.close()
+
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "routed_to_local_total" in metrics.text
+    assert "retrieval_latency_ms" in metrics.text
+    assert "rerank_latency_ms" in metrics.text
+    assert "local_generation_latency_ms" in metrics.text
+    assert "usage_ledger_write_failures_total" in metrics.text
+
+
+def test_phase3f_reranker_exception_falls_back_to_external(gateway_client, monkeypatch):
+    client, gw, _ = gateway_client
+    old_retrieval = gw.retrieval_pipeline
+    old_get_decision = gw.get_decision
+    gw.retrieval_pipeline = SimpleNamespace(
+        run=lambda q: (_ for _ in ()).throw(RuntimeError("simulated reranker failure"))
+    )
+
+    async def fake_get_decision(query, mode, threshold, explain):
+        return ({
+            "tier": "LOW", "p_strong": 0.1, "threshold": 0.7,
+            "confidence": 0.9, "mode": mode, "source": "test_router",
+            "reasoning": "fallback test", "signals": [],
+        }, 1.0)
+
+    gw.get_decision = fake_get_decision
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"query": "What is Chandrayaan-3?", "use_cache": False},
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["decision"]["tier"] == "LOW"
+        assert "retrieval/reranking failed" in body["decision"]["reasoning"]
+    finally:
+        gw.retrieval_pipeline = old_retrieval
+        gw.get_decision = old_get_decision

@@ -1,12 +1,14 @@
 """MVP 3C: Qdrant Top-10 -> bge-reranker-base Top-3."""
 from __future__ import annotations
 import logging, math, time
+from threading import Lock
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from sentence_transformers import CrossEncoder
 from gateway.retriever import LocalRetriever, RetrievedChunk, RetrievalResult
 from gateway.settings import load_gateway_settings
+from gateway.metrics import RERANK_MODEL_LOAD_LATENCY
 
 log = logging.getLogger("gateway.reranker")
 
@@ -53,16 +55,24 @@ class LocalReranker:
     def __init__(self) -> None:
         self.cfg = load_gateway_settings()
         self._model: CrossEncoder | None = None
+        self._model_lock = Lock()
+        self._predict_lock = Lock()
 
     @property
     def model(self) -> CrossEncoder:
         if self._model is None:
-            from sentence_transformers import CrossEncoder
-            log.info("Loading reranker model: %s", self.cfg.reranker_model)
-            self._model = CrossEncoder(
-                self.cfg.reranker_model,
-                max_length=self.cfg.reranker_max_length,
-            )
+            with self._model_lock:
+                if self._model is None:
+                    from sentence_transformers import CrossEncoder
+                    load_started = time.perf_counter()
+                    log.info("Loading reranker model: %s", self.cfg.reranker_model)
+                    self._model = CrossEncoder(
+                        self.cfg.reranker_model,
+                        max_length=self.cfg.reranker_max_length,
+                    )
+                    load_ms = (time.perf_counter() - load_started) * 1000
+                    RERANK_MODEL_LOAD_LATENCY.observe(max(0.0, load_ms))
+                    log.info("Reranker model load: %.1f ms", load_ms)
         return self._model
 
     @staticmethod
@@ -79,10 +89,16 @@ class LocalReranker:
                                 retrieval_latency_ms=retrieval.latency_ms)
 
         pairs = [(query, c.text) for c in candidates]
+        # Access the lazy-loaded model before timing predict() so model download /
+        # initialization is observable separately from steady-state inference.
+        model = self.model
         inference_started = time.perf_counter()
-        raw_scores = self.model.predict(
-            pairs, show_progress_bar=False, batch_size=min(32, len(pairs))
-        )
+        # A single local cross-encoder inference at a time keeps memory and CPU
+        # pressure predictable on the target laptop while other HTTP tasks stay responsive.
+        with self._predict_lock:
+            raw_scores = model.predict(
+                pairs, show_progress_bar=False, batch_size=min(32, len(pairs))
+            )
         inference_ms = (time.perf_counter() - inference_started) * 1000
 
         ranked = sorted(

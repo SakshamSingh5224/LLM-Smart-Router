@@ -1,8 +1,13 @@
 import datetime
+import logging
 from typing import Literal, Optional
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+
+from gateway.metrics import USAGE_LEDGER_WRITE_FAILURES
+
+log = logging.getLogger("gateway.policy")
 
 from gateway.db.models import UserPolicy, Policy, UsageLedger
 from smartrouter.labels import HIGH
@@ -81,5 +86,17 @@ class PolicyEngine:
             cost_usd=cost,
             was_downgraded=downgraded
         )
-        self.db.add(record)
-        self.db.commit()
+        try:
+            self.db.add(record)
+            self.db.commit()
+            return True
+        except Exception:
+            # Usage is best-effort telemetry; a transient DB failure must not
+            # turn a successful model response into a 500 or kill an SSE stream.
+            try:
+                self.db.rollback()
+            except Exception:
+                log.exception("Rollback after usage-ledger failure also failed.")
+            USAGE_LEDGER_WRITE_FAILURES.inc()
+            log.exception("Usage-ledger write failed; continuing without recording usage.")
+            return False

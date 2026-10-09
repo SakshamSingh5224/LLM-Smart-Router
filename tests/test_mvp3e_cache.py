@@ -182,3 +182,15 @@ def test_semantic_embedding_model_warmup():
     model = cache._embedding_model
     assert cache.warm_semantic_model() is True
     assert cache._embedding_model is model
+
+
+def test_semantic_cache_preserves_source_metadata():
+    cache = make_cache()
+    sources = [{"filename": "isro.pdf", "source": "isro.pdf", "page": 12, "rerank_score": 0.93}]
+    cache.put(
+        "What is Chandrayaan-3?", "balanced", "It is a lunar mission.",
+        "LOCAL-RAG", 0.0, {"tier": "LOCAL-RAG"}, sources=sources,
+    )
+    hit = cache.semantic_get("What is Chandrayaan-3?", "balanced")
+    assert hit is not None
+    assert hit.sources == sources

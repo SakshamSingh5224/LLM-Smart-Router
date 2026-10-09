@@ -1,0 +1,10 @@
+apiVersion: 1
+providers:
+  - name: LLM Smart Router
+    orgId: 1
+    folder: LLM Smart Router
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

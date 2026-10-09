@@ -63,7 +63,8 @@ document.addEventListener("DOMContentLoaded", () => {
                     ['3B · Intent routing enabled', status.phase_3b?.enabled],
                     ['3C · Retrieval / reranking enabled', status.phase_3c?.enabled],
                     ['3D · Local RAG enabled', status.phase_3d?.enabled],
-                    ['3E · Semantic cache enabled', status.phase_3e?.enabled]
+                    ['3E · Semantic cache enabled', status.phase_3e?.enabled],
+                    ['3F · Gateway observability enabled', status.phase_3f?.enabled && status.observability?.enabled]
                 ];
                 phases.forEach(([label, enabled]) => {
                     const row = document.createElement('div');
@@ -181,6 +182,8 @@ document.addEventListener("DOMContentLoaded", () => {
         const generationLatency = Number(data.generation_latency_ms || 0);
         const totalLatency = Number(data.total_latency_ms || 0);
         const cost = Number(data.est_cost_usd || 0);
+        const costAvoided = Number(data.estimated_cost_avoided_usd || 0);
+        const ttft = data.ttft_ms == null ? null : Number(data.ttft_ms);
         const cacheLabel = data.cache_hit ? 'CACHE HIT' : 'CACHE MISS';
         const source = String(decision.source || 'unknown');
         const reasoning = String(decision.reasoning || '');
@@ -204,7 +207,9 @@ document.addEventListener("DOMContentLoaded", () => {
             `Router: ${latency.toFixed(1)} ms`,
             `Generation: ${generationLatency.toFixed(1)} ms`,
             `Total: ${totalLatency.toFixed(1)} ms`,
-            `Est. cost: $${cost.toFixed(6)}`
+            ...(ttft === null ? [] : [`TTFT: ${ttft.toFixed(1)} ms`]),
+            `Est. cost: $${cost.toFixed(6)}`,
+            ...(normalizedTier === 'local-rag' ? [`Est. cost avoided: $${costAvoided.toFixed(6)}`] : [])
         ].forEach((label) => {
             const item = document.createElement('span');
             item.textContent = label;
@@ -228,6 +233,28 @@ document.addEventListener("DOMContentLoaded", () => {
             bubbleDiv.innerText = answerText;
         }
         msgDiv.appendChild(bubbleDiv);
+
+        // Display source metadata returned by local RAG. Use textContent throughout
+        // so filenames/categories cannot inject markup into the chat page.
+        if (Array.isArray(data.sources) && data.sources.length > 0) {
+            const sourceDetails = document.createElement('details');
+            sourceDetails.className = 'source-details';
+            const sourceSummary = document.createElement('summary');
+            sourceSummary.textContent = `Sources (${data.sources.length})`;
+            sourceDetails.appendChild(sourceSummary);
+            const sourceList = document.createElement('ul');
+            data.sources.forEach((source) => {
+                const item = document.createElement('li');
+                const filename = source.filename || source.source || 'Unknown document';
+                const page = source.page == null ? '' : ` · page ${source.page}`;
+                const score = Number.isFinite(Number(source.rerank_score))
+                    ? ` · relevance ${Number(source.rerank_score).toFixed(3)}` : '';
+                item.textContent = `${filename}${page}${score}`;
+                sourceList.appendChild(item);
+            });
+            sourceDetails.appendChild(sourceList);
+            msgDiv.appendChild(sourceDetails);
+        }
 
         // Build Routing Explanation
         if (explainCheckbox.checked && reasoning) {

@@ -17,3 +17,16 @@ results/*
 .vscode/
 .idea/
 .DS_Store
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs and local runtime artifacts
+*.log
+.DS_Store
+
+# Model and ML caches
+.cache/
+.huggingface/

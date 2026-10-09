@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import time
+from threading import Lock
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -70,13 +71,16 @@ class LocalRetriever:
             api_key=self.cfg.qdrant_api_key or None,
         )
         self._embedding_model: TextEmbedding | None = None
+        self._embedding_model_lock = Lock()
 
     @property
     def embedding_model(self) -> TextEmbedding:
         if self._embedding_model is None:
-            from fastembed import TextEmbedding
-            log.info("Loading retrieval embedding model: %s", self.cfg.embedding_model)
-            self._embedding_model = TextEmbedding(model_name=self.cfg.embedding_model)
+            with self._embedding_model_lock:
+                if self._embedding_model is None:
+                    from fastembed import TextEmbedding
+                    log.info("Loading retrieval embedding model: %s", self.cfg.embedding_model)
+                    self._embedding_model = TextEmbedding(model_name=self.cfg.embedding_model)
         return self._embedding_model
 
     def retrieve(self, query: str, top_k: int | None = None) -> RetrievalResult:

@@ -1,6 +1,6 @@
 PY := .venv/bin/python
 
-.PHONY: setup data verify bench eval train-router eval-router serve-router serve-gateway verify3 test all-phase1 all-phase2 migrate migrate-new migrate-stamp
+.PHONY: setup data verify bench eval train-router eval-router serve-router serve-gateway verify3 verify-phase3f test all-phase1 all-phase2 migrate migrate-new migrate-stamp
 
 setup:  ## install system deps, Ollama, models, python env
 	bash scripts/setup_ubuntu.sh
@@ -32,6 +32,9 @@ serve-gateway:  ## run the gateway + frontend on :8000
 verify3:  ## Phase 3 exit-criteria check (gateway must already be running)
 	$(PY) scripts/verify_phase3.py
 
+verify-phase3f:  ## Phase 3F health/status/metrics and optional authenticated smoke checks
+	$(PY) scripts/verify_phase3f.py
+
 test:  ## offline unit tests
 	$(PY) -m unittest discover -s tests -v
 
@@ -48,9 +51,13 @@ all-phase1: data verify bench eval
 
 all-phase2: train-router eval-router
 
-.PHONY: mvp3c-test mvp3c-calibrate
+.PHONY: mvp3c-test mvp3c-calibrate mvp3f-test
 mvp3c-test:
 	PYTHONPATH=. $(PY) -m scripts.test_mvp3c "$(QUERY)"
 
 mvp3c-calibrate:
 	PYTHONPATH=. $(PY) -m scripts.calibrate_mvp3c
+
+
+mvp3f-test:  ## Phase 3F metrics/usage regression tests
+	PYTHONPATH=. $(PY) -m pytest -q tests/test_mvp3f_metrics.py tests/test_mvp3d_gateway.py

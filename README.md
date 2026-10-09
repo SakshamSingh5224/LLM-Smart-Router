@@ -483,3 +483,70 @@ to a remote Render instance by default. Do not mark cloud Local-RAG as live
 until Qdrant, Redis, and Ollama are reachable from the deployed gateway and a
 successful production request confirms `source=local_rag`; repeat a similar
 query and confirm `cache_hit=true` to validate 3E.
+
+
+## Phase 3F — Gateway integration and observability
+
+Phase 3F wires the MVP 3B–3E local-RAG path into the existing authenticated gateway and exposes route/cache/retrieval/generation telemetry. It keeps MVP 2 JWT authentication, policy evaluation, LOW/HIGH routing, exact cache behavior, and SSE streaming in place.
+
+### Local stack
+
+1. Copy `.env.example` to `.env`, then set a unique `JWT_SECRET`, your provider keys, and the same `DATABASE_URL` used by the gateway. Keep `.env` private.
+2. Ensure Ollama is running on the host and has the configured local model available (`ollama list`).
+3. Start/rebuild the stack from the repository root:
+
+   ```bash
+   docker compose --env-file .env -f docker/docker-compose.yml up -d --build
+   docker compose --env-file .env -f docker/docker-compose.yml ps
+   ```
+
+   Avoid `docker compose down -v` unless you intentionally want to delete the persisted Qdrant, Redis, and model-cache volumes.
+
+4. Open the local tools:
+   - Gateway health: `http://127.0.0.1:8000/health`
+   - System feature status: `http://127.0.0.1:8000/api/system/status`
+   - Prometheus metrics: `http://127.0.0.1:8000/metrics`
+   - Prometheus UI: `http://127.0.0.1:9090`
+   - Grafana dashboard: `http://127.0.0.1:3000` (admin password comes from `GRAFANA_ADMIN_PASSWORD`; local fallback is `admin`, so set your own value)
+   - Qdrant: `http://127.0.0.1:6333`
+
+The Grafana dashboard is provisioned automatically from `docker/grafana/dashboards/llm-smart-router-phase3f.json`. It charts local routes, cache hits, external fallback reasons, retrieval/reranker/local-generation/TTFT latency, estimated cost avoided, and usage-ledger write failures. `local_rag_accuracy_ratio` is deliberately not guessed from serving traffic; it is reserved for the Phase 3G evaluation workflow.
+
+### Smoke checks
+
+Public health/status/metrics checks:
+
+```bash
+source .venv/bin/activate
+python scripts/verify_phase3f.py --base-url http://127.0.0.1:8000
+```
+
+For authenticated chat and usage-ledger checks, log in to `/api/auth/login` to obtain an access token, then export it without printing it:
+
+```bash
+read -r -s -p 'Access token: ' GATEWAY_TEST_TOKEN; echo
+export GATEWAY_TEST_TOKEN
+python scripts/verify_phase3f.py --base-url http://127.0.0.1:8000
+unset GATEWAY_TEST_TOKEN
+```
+
+The script never prints the token. Its authenticated chat check can take several minutes on the first cold reranker model load; later requests should be much faster. Check `reranker_model_load_latency_ms` separately from steady-state `rerank_latency_ms` in logs/metrics.
+
+### Database transaction and usage accounting
+
+The gateway commits the read-only policy transaction before retrieval/model work and writes usage through a fresh short-lived SQLAlchemy session. Neon connections use `pool_pre_ping` and `pool_recycle`; failed ledger writes are rolled back and counted by `usage_ledger_write_failures_total` without converting an otherwise successful answer into a gateway 500. Cached requests are counted in the usage ledger too, with zero generated tokens/cost, so cache hits do not bypass query quotas.
+
+### Local gateway versus Vercel/Render
+
+The Vercel frontend's `frontend/config.js` points to the public Render gateway. Render cannot reach an Ollama instance bound to your Ubuntu host's localhost, and the provided Render configuration keeps retrieval/local RAG/semantic cache disabled unless you deploy reachable external services. The local Phase 3F stack is tested through `http://127.0.0.1:8000`; this does **not** automatically connect the Vercel website to your laptop. To make Vercel use local RAG, the gateway and Qdrant/Redis/Ollama must be reachable through a secure hosted deployment or secured tunnel, with authentication and firewall rules configured appropriately.
+
+### Phase 3F exit checklist
+
+- [x] Authenticated non-streaming and SSE paths retain JWT/policy gates.
+- [x] Local RAG route, semantic/exact cache, insufficient-context fallback, and generation-error fallback are instrumented.
+- [x] `/metrics` exposes request and Phase 3F custom metric families.
+- [x] Grafana dashboard and Prometheus data source are provisioned as files.
+- [x] Retrieval/model work is moved off the ASGI event loop to keep health/status responsive.
+- [x] Neon idle-transaction handling and best-effort usage-ledger failure reporting are implemented.
+- [ ] Run the smoke-check script against the actual local Docker stack and inspect Grafana/Prometheus in your environment.
+- [ ] Phase 3G still owns the curated accuracy, groundedness, latency, failure-injection, cost-comparison, and regression evaluation.
