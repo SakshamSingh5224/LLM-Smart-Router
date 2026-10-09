@@ -1,8 +1,8 @@
 """Response caching with exact in-process lookup and MVP 3E Redis semantic cache.
 
-The exact cache preserves the existing gateway behavior.  For LOCAL_KB queries,
-MVP 3E adds a Redis-backed semantic cache using the same BAAI/bge-small-en-v1.5
-embedding model as retrieval.  Redis failures are intentionally fail-open: a
+The exact cache preserves the existing gateway behavior. MVP 3E also provides a
+Redis-backed semantic cache for successful responses across tiers, using the same
+BAAI/bge-small-en-v1.5 embedding model as retrieval.  Redis failures are intentionally fail-open: a
 request simply continues through normal retrieval/generation.
 """
 from __future__ import annotations
@@ -89,7 +89,7 @@ class ResponseCache:
         *,
         redis_url: str = "",
         semantic_enabled: bool = True,
-        semantic_threshold: float = 0.92,
+        semantic_threshold: float = 0.82,
         embedding_model: str = "BAAI/bge-small-en-v1.5",
     ):
         self.max_size, self.ttl_s = max_size, ttl_s
@@ -158,8 +158,10 @@ class ResponseCache:
             while len(self._store) > self.max_size:
                 self._store.popitem(last=False)
 
-        if tier == "LOCAL-RAG":
-            self.semantic_put(query, mode, entry)
+        # Cache successful responses from every tier. Semantic lookup still
+        # runs only after policy checks and only when the request does not
+        # force a tier. A conservative similarity threshold limits false hits.
+        self.semantic_put(query, mode, entry)
 
     def warm_semantic_model(self) -> bool:
         """Load the semantic embedding model before serving requests."""

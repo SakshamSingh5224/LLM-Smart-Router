@@ -64,7 +64,7 @@ def make_cache(ttl=3600):
         max_size=10,
         ttl_s=ttl,
         semantic_enabled=True,
-        semantic_threshold=0.92,
+        semantic_threshold=0.82,
         embedding_model="BAAI/bge-small-en-v1.5",
     )
     cache._redis = FakeRedis()
@@ -91,7 +91,34 @@ def test_semantic_cache_hit_above_threshold():
     assert hit is not None
     assert hit.answer == "It is a lunar mission."
     assert hit.similarity is not None
-    assert hit.similarity >= 0.92
+    assert hit.similarity >= 0.82
+    assert hit.decision == decision
+
+
+def test_semantic_cache_stores_non_local_rag_responses():
+    cache = make_cache()
+    decision = {
+        "tier": "LOW",
+        "p_strong": 0.05,
+        "threshold": 0.70,
+        "confidence": 0.80,
+        "mode": "balanced",
+        "source": "classifier",
+        "reasoning": "simple general question",
+        "signals": [],
+    }
+    cache.put(
+        "Explain semantic caching in two sentences.",
+        "balanced",
+        "Semantic caching reuses answers for similar questions.",
+        "LOW",
+        0.05,
+        decision,
+    )
+
+    hit = cache.semantic_get("What does semantic caching mean?", "balanced")
+    assert hit is not None
+    assert hit.answer == "Semantic caching reuses answers for similar questions."
     assert hit.decision == decision
 
 
@@ -137,7 +164,7 @@ def test_semantic_cache_invalidation():
 def test_redis_unavailable_fails_open():
     cache = ResponseCache(
         semantic_enabled=True,
-        semantic_threshold=0.92,
+        semantic_threshold=0.82,
         redis_url="redis://127.0.0.1:1",
     )
     # Force the same failure mode even when redis-py is installed.

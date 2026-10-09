@@ -87,7 +87,7 @@ services:
       RERANK_RELEVANCE_THRESHOLD: "${RERANK_RELEVANCE_THRESHOLD:-0.70}"
       REDIS_URL: "redis://redis:6379/0"
       SEMANTIC_CACHE_ENABLED: "${SEMANTIC_CACHE_ENABLED:-true}"
-      SEMANTIC_CACHE_THRESHOLD: "${SEMANTIC_CACHE_THRESHOLD:-0.92}"
+      SEMANTIC_CACHE_THRESHOLD: "${SEMANTIC_CACHE_THRESHOLD:-0.82}"
       # Added for Phase 4 load/chaos testing: without these, this container
       # silently falls back to SQLite (chokes under concurrent load-test writes)
       # and the default 30 req/min rate limit (dominates results at load-test

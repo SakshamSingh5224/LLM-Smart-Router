@@ -53,7 +53,7 @@ class GatewaySettings:
     # MVP 3E - Redis semantic cache
     redis_url: str = "redis://localhost:6379/0"
     semantic_cache_enabled: bool = True
-    semantic_cache_threshold: float = 0.92
+    semantic_cache_threshold: float = 0.82
 
     def __post_init__(self):
         override = os.getenv("GATEWAY_LOG_PATH")
@@ -106,5 +106,5 @@ def load_gateway_settings() -> GatewaySettings:
         local_rag_temperature=float(e("LOCAL_RAG_TEMPERATURE", "0.2")),
         redis_url=e("REDIS_URL", "redis://localhost:6379/0"),
         semantic_cache_enabled=e("SEMANTIC_CACHE_ENABLED", "true").lower() in ("1", "true", "yes"),
-        semantic_cache_threshold=float(e("SEMANTIC_CACHE_THRESHOLD", "0.92")),
+        semantic_cache_threshold=float(e("SEMANTIC_CACHE_THRESHOLD", "0.82")),
     )
