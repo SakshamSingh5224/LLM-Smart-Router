@@ -548,5 +548,87 @@ The Vercel frontend's `frontend/config.js` points to the public Render gateway. 
 - [x] Grafana dashboard and Prometheus data source are provisioned as files.
 - [x] Retrieval/model work is moved off the ASGI event loop to keep health/status responsive.
 - [x] Neon idle-transaction handling and best-effort usage-ledger failure reporting are implemented.
-- [ ] Run the smoke-check script against the actual local Docker stack and inspect Grafana/Prometheus in your environment.
+- [x] Run the smoke-check script against the actual local Docker stack and verify Grafana/Prometheus in the environment.
 - [ ] Phase 3G still owns the curated accuracy, groundedness, latency, failure-injection, cost-comparison, and regression evaluation.
+
+---
+
+## Phase 3A–3F — Implementation and Verification Status
+
+**Status: Core implementation complete; verified through local and deployed integration tests.**
+
+MVP-3 extends the routing gateway with a local retrieval-augmented generation (RAG) path for questions grounded in the Indian-context knowledge base.
+
+### Phase 3A — Knowledge Base and Ingestion
+
+- PDF documents are ingested, split into chunks, embedded, and indexed in Qdrant.
+- Current verified knowledge base: **3 PDFs, 62 pages, and 67 chunks**.
+- The Qdrant collection used by the local RAG path is `bharat_knowledge_base`.
+- One ingested document is `data/knowledge_base/isro/chandrayaan3.pdf`.
+
+The original plan described a larger collection of Indian-context documents. The current three-PDF collection is the verified implementation state, not completion of the original 80-PDF target.
+
+### Phase 3B — Intent Classification and Routing
+
+- The gateway evaluates whether a request should use the local knowledge base.
+- Local-knowledge-base requests can be routed to `LOCAL-RAG`.
+- Routing decisions include the selected tier, confidence, threshold, source, and reasoning.
+- General questions can continue through the existing model-routing path.
+
+### Phase 3C — Retrieval and Reranking
+
+- Retrieves relevant chunks from Qdrant.
+- Reranks retrieved candidates and compares relevance against the configured threshold.
+- Returns source metadata, including filename, document path, page number, chunk index, and relevance scores.
+- The verified Chandrayaan-3 integration test returned relevant sources from pages 2, 4, and 8.
+
+### Phase 3D — Local RAG Answer Generation
+
+- The local RAG path generates answers using retrieved knowledge-base context.
+- The gateway returns the answer together with the routing decision and source metadata.
+- The verified Chandrayaan-3 request selected `LOCAL-RAG` with a reranking score above the configured `0.700` threshold.
+
+Answers should still be evaluated against their cited source documents; successful retrieval does not guarantee that every generated statement is correct.
+
+### Phase 3E — Semantic Caching
+
+- The gateway supports caching to avoid repeating work for eligible requests.
+- Cache-hit status and estimated cost savings are included in the response metadata.
+- Cache behavior was verified through repeated chat requests.
+
+### Phase 3F — Gateway, Authentication, and Observability
+
+The following components have been tested:
+
+- Authenticated chat requests through the gateway.
+- User usage accounting.
+- Prometheus metrics scraping.
+- Grafana dashboards displaying real metrics.
+- Local Docker services, including the gateway, router service, Qdrant, Redis, Prometheus, and Grafana.
+- End-to-end local RAG requests with source metadata.
+
+The existing authentication, policy, and usage-enforcement functionality remains part of the gateway.
+
+### Deployment — Frontend and Local Gateway
+
+The frontend is deployed on Vercel. During the current free-tier integration setup, it reaches the locally running gateway through a Cloudflare Quick Tunnel.
+
+Important operational notes:
+
+- The local Docker services and Cloudflare Tunnel must be running for this integration to work.
+- A Quick Tunnel URL is temporary and may change. Update `frontend/config.js` and the relevant rewrite destination in `vercel.json` if it changes.
+- This setup is suitable for development and demonstration; it is not a permanently hosted backend.
+- Never commit `.env` files, API keys, access tokens, passwords, or other secrets to the repository.
+
+### Phase 3G — Evaluation and Hardening (Next)
+
+Phase 3G is the next milestone and is **not yet marked complete**.
+
+Planned work:
+
+1. Evaluate routing accuracy across local-knowledge-base, general-knowledge, and fallback requests.
+2. Test answer faithfulness against retrieved documents and identify hallucinations.
+3. Test low-relevance retrieval, missing documents, and empty-result fallback behavior.
+4. Test authentication, authorization, rate limits, invalid requests, timeouts, and error handling.
+5. Benchmark uncached latency, cache hit rate, and estimated cost savings.
+6. Document reproducible evaluation results and known limitations before declaring the MVP release-ready.
