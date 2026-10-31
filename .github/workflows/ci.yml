@@ -15,8 +15,24 @@ jobs:
         with:
           python-version: "3.12"
           cache: "pip"
-      - run: pip install -r requirements.txt
+      - name: Install offline test dependencies (no Torch/model downloads)
+        run: >-
+          pip install pytest httpx python-dotenv pandas scikit-learn joblib
+          fastapi sqlalchemy bcrypt 'python-jose[cryptography]'
+          'qdrant-client>=1.12,<2' 'redis>=5,<7'
+          prometheus-fastapi-instrumentator
       - name: Offline unit tests (no network/Ollama/Groq needed)
+        env:
+          DATABASE_URL: 'sqlite:///:memory:'
+          SEMANTIC_CACHE_ENABLED: 'false'
+          ENABLE_MVP3_ROUTING: 'true'
+          ENABLE_MVP3_RETRIEVAL: 'true'
+          GATEWAY_RATE_LIMIT_PER_MIN: '10000'
+          GATEWAY_API_KEY: ''
+          HIGH_API_KEY: 'offline-test-key'
+          ROUTER_SERVICE_URL: ''
+          ROUTER_MODE: 'balanced'
+          ROUTER_ARTIFACT_PATH: '/tmp/no-such-router.joblib'
         run: python -m pytest tests/ -v
 
   docker-build:
@@ -56,3 +72,4 @@ jobs:
         with:
           name: router-artifact
           path: results/router_artifact.joblib
+

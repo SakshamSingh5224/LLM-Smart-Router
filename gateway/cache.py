@@ -23,7 +23,7 @@ from prometheus_client import Counter
 log = logging.getLogger("gateway.cache")
 
 _WS_RE = re.compile(r"\s+")
-SEMANTIC_KEY_PREFIX = "llm-router:semantic-cache:"
+SEMANTIC_KEY_PREFIX = "llm-router:semantic-cache:v3:"
 SEMANTIC_CACHE_HIT_COUNTER = Counter(
     "semantic_cache_hits_total",
     "Semantic cache hits",
@@ -52,6 +52,68 @@ def normalize(text: str) -> str:
     return _WS_RE.sub(" ", (text or "").strip().lower())
 
 
+_LANGUAGE_ALIASES = {
+    "hindi": "hi", "english": "en", "हिंदी": "hi", "हिन्दी": "hi",
+    "kannada": "kn", "tamil": "ta", "telugu": "te", "marathi": "mr",
+    "bengali": "bn", "gujarati": "gu", "malayalam": "ml", "punjabi": "pa",
+    "urdu": "ur", "sanskrit": "sa", "french": "fr", "german": "de",
+    "spanish": "es", "italian": "it", "portuguese": "pt", "arabic": "ar",
+    "japanese": "ja", "chinese": "zh", "korean": "ko", "russian": "ru",
+}
+_LANGUAGE_RE = re.compile(
+    r"\b(?:answer|respond|reply|write|explain|summari[sz]e|translate)\b[^.!?\n]{0,60}?\b(?:in|into|to)\s+(?:the\s+)?("
+    + "|".join(sorted(_LANGUAGE_ALIASES, key=len, reverse=True)) + r")\b", re.I,
+)
+_DIRECT_LANGUAGE_RE = re.compile(r"\b(?:answer|respond|reply)\s+(?:only\s+)?in\s+([a-z]+)\b", re.I)
+_LIMIT_RE = re.compile(r"\b(under|at most|no more than|maximum|max|exactly|at least)\s+(\d+)\s+(words?|sentences?|bullets?|tokens?)\b", re.I)
+
+def request_constraints(query: str) -> dict:
+    """Conservative compatibility guard, not a proof of semantic equivalence."""
+    text = query.casefold()
+    languages = {_LANGUAGE_ALIASES.get(m.casefold(), m.casefold()) for m in _LANGUAGE_RE.findall(text)}
+    for language in _DIRECT_LANGUAGE_RE.findall(text):
+        if language not in {"json", "csv", "xml", "markdown", "code", "a", "the", "under", "exactly"}:
+            languages.add(_LANGUAGE_ALIASES.get(language, language))
+    if re.search(r"(?:हिंदी|हिन्दी)\s*में", text):
+        languages.add("hi")
+    # Natural questions about a language are not output-language instructions.
+    formats = sorted(set(re.findall(r"\b(json|csv|xml|markdown|table|bullets?|bullet points|code only)\b", text)))
+    limits = [list(m) for m in sorted(_LIMIT_RE.findall(text))]
+    return {
+        "languages": sorted(languages), "formats": formats, "limits": limits,
+        "numbers": sorted(set(re.findall(r"(?<![a-z])[-+]?\d+(?:\.\d+)?", text))),
+        "negations": sorted(set(re.findall(r"\b(no|not|never|without|except|excluding)\b", text))),
+    }
+
+def cacheable_answer(query: str, answer: str) -> bool:
+    """Reject known instruction violations before either cache is populated."""
+    constraints = request_constraints(query)
+    if "hi" in constraints["languages"]:
+        letters = sum(character.isalpha() for character in answer)
+        devanagari = len(re.findall(r"[\u0900-\u097f]", answer))
+        if not letters or devanagari < letters * 0.5:
+            return False
+    if "en" in constraints["languages"] and re.search(r"[\u0900-\u097f]", answer):
+        return False
+    words = len(answer.split())
+    for operator, count, unit in constraints["limits"]:
+        if not unit.startswith("word"):
+            continue
+        maximum = int(count) - (operator == "under")
+        if operator in ("under", "at most", "no more than", "maximum", "max") and words > maximum:
+            return False
+        if operator == "exactly" and words != int(count):
+            return False
+        if operator == "at least" and words < int(count):
+            return False
+    if "json" in constraints["formats"]:
+        try:
+            json.loads(answer)
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 @dataclass
 class CacheEntry:
     answer: str
@@ -78,8 +140,7 @@ class ResponseCache:
     """Exact LRU/TTL cache plus a Redis semantic cache.
 
     ``get``/``put`` retain the original exact-match interface.  ``semantic_get``
-    and ``semantic_put`` are used only on the LOCAL_KB path, so enabling MVP 3E
-    does not change LOW/HIGH routing semantics.
+    and ``semantic_put`` support compatible paraphrases across tiers after policy checks.
     """
 
     def __init__(
@@ -147,6 +208,8 @@ class ResponseCache:
         decision: Optional[dict[str, Any]] = None,
         sources: Optional[list[dict[str, Any]]] = None,
     ) -> None:
+        if not cacheable_answer(query, answer):
+            return
         key = self._key(query, mode)
         entry = CacheEntry(
             answer, tier, p_strong, time.time(), decision=decision,
@@ -204,6 +267,7 @@ class ResponseCache:
     def _serialize(entry: CacheEntry, query: str, vector: list[float], mode: str) -> dict[str, Any]:
         return {
             "query": query,
+            "constraints": request_constraints(query),
             "mode": mode,
             "query_embedding": vector,
             "answer": entry.answer,
@@ -220,6 +284,7 @@ class ResponseCache:
             return None
 
         try:
+            query_constraints = request_constraints(query)
             query_vector = self._embed(query)
             best: Optional[CacheEntry] = None
             best_score = -1.0
@@ -227,7 +292,9 @@ class ResponseCache:
             pattern = f"{SEMANTIC_KEY_PREFIX}{mode}:*"
             # MVP cache size is intentionally bounded. Redis SCAN avoids blocking
             # Redis while keeping the implementation dependency-light.
-            for key in self._redis.scan_iter(match=pattern, count=max(10, self.max_size)):
+            for index, key in enumerate(self._redis.scan_iter(match=pattern, count=max(10, self.max_size))):
+                if index >= self.max_size:
+                    break
                 raw = self._redis.get(key)
                 if not raw:
                     continue
@@ -236,6 +303,10 @@ class ResponseCache:
                     created_at = float(payload.get("created_at", 0.0))
                     if self.ttl_s > 0 and time.time() - created_at > self.ttl_s:
                         self._redis.delete(key)
+                        continue
+                    if payload.get("constraints") != query_constraints:
+                        continue
+                    if not cacheable_answer(query, str(payload.get("answer", ""))):
                         continue
                     score = _cosine_similarity(query_vector, payload["query_embedding"])
                     if score > best_score:
@@ -336,3 +407,4 @@ class ResponseCache:
             "hit_rate": round(self.hits / total, 4) if total else 0.0,
             **self.semantic_stats(),
         }
+

@@ -3,7 +3,7 @@ import logging
 from typing import Literal, Optional
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, and_, or_
 
 from gateway.metrics import USAGE_LEDGER_WRITE_FAILURES
 
@@ -22,10 +22,9 @@ class PolicyEngine:
         self.db = db
 
     def get_user_policy(self, user_id: int) -> Optional[Policy]:
-        up = self.db.query(UserPolicy).filter(UserPolicy.user_id == user_id).first()
-        if not up:
-            return None
-        return self.db.query(Policy).filter(Policy.id == up.policy_id).first()
+        return (self.db.query(Policy)
+                .join(UserPolicy, UserPolicy.policy_id == Policy.id)
+                .filter(UserPolicy.user_id == user_id).first())
 
     def get_current_usage(self, user_id: int, tier_scope: str = "all") -> dict:
         now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
@@ -49,19 +48,31 @@ class PolicyEngine:
         }
 
     def evaluate(self, user_id: int) -> PolicyDecision:
-        policy = self.get_user_policy(user_id)
-        if not policy:
+        # One SQL round trip for the policy and monthly usage. Do not cache
+        # authorization/quota state or defer accounting to improve latency.
+        now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        start_of_month = datetime.datetime(now.year, now.month, 1)
+        row = (self.db.query(
+                    Policy, func.count(UsageLedger.id).label("queries"),
+                    func.coalesce(func.sum(UsageLedger.tokens_est), 0).label("tokens"))
+               .join(UserPolicy, UserPolicy.policy_id == Policy.id)
+               .outerjoin(UsageLedger, and_(
+                   UsageLedger.user_id == UserPolicy.user_id,
+                   UsageLedger.ts >= start_of_month,
+                   or_(Policy.tier_scope.is_(None), Policy.tier_scope != "high", UsageLedger.tier_used == HIGH)))
+               .filter(UserPolicy.user_id == user_id)
+               .group_by(*Policy.__table__.columns).first())
+        if row is None:
             return PolicyDecision(action="allow", reason="No policy assigned, fail-open default.")
-
+        policy = row[0]
         if policy.action_on_exhaustion == "allow_overage":
             return PolicyDecision(action="allow_overage", reason="Admin/unlimited policy active.")
+        usage = {"queries": row.queries or 0, "tokens": row.tokens or 0}
 
-        usage = self.get_current_usage(user_id, policy.tier_scope)
-        
         exhausted = False
-        if policy.query_threshold and usage["queries"] >= policy.query_threshold:
+        if policy.query_threshold is not None and usage["queries"] >= policy.query_threshold:
             exhausted = True
-        if policy.token_threshold and usage["tokens"] >= policy.token_threshold:
+        if policy.token_threshold is not None and usage["tokens"] >= policy.token_threshold:
             exhausted = True
 
         if exhausted:
@@ -100,3 +111,4 @@ class PolicyEngine:
             USAGE_LEDGER_WRITE_FAILURES.inc()
             log.exception("Usage-ledger write failed; continuing without recording usage.")
             return False
+

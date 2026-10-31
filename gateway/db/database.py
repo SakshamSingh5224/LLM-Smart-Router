@@ -22,6 +22,23 @@ else:
     _engine_kwargs.update(pool_pre_ping=True, pool_recycle=300)
 
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args, **_engine_kwargs)
+# Resolve fresh IPv4 addresses for each Neon connection; preserve hostname/SSL.
+if engine.dialect.name == "postgresql" and (engine.url.host or "").endswith(".neon.tech"):
+    import socket
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "do_connect")
+    def _neon_ipv4_connect(dialect, conn_rec, cargs, cparams):
+        host = engine.url.host
+        addresses = list(dict.fromkeys(
+            result[4][0] for result in socket.getaddrinfo(
+                host, engine.url.port or 5432, socket.AF_INET, socket.SOCK_STREAM
+            )
+        ))
+        cparams["host"] = ",".join([host] * len(addresses))
+        cparams["hostaddr"] = ",".join(addresses)
+        cparams.setdefault("connect_timeout", 10)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -31,3 +48,4 @@ def get_db():
         yield db
     finally:
         db.close()
+

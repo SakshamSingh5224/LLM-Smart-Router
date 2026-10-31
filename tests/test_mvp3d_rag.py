@@ -40,3 +40,20 @@ def test_local_rag_stream_delegates_to_existing_client():
     chunks = asyncio.run(collect())
     assert chunks[0].delta == "grounded"
     assert chunks[-1].done is True
+
+
+
+def test_local_output_violation_sets_error_instead_of_success():
+    class TooLong:
+        async def stream_chat(self, messages, **kwargs):
+            yield StreamChunk(delta="one two three four five")
+            yield StreamChunk(done=True)
+    result = asyncio.run(LocalRagClient(TooLong()).generate(RagRequest("Answer in under 3 words.", "context")))
+    assert result.error.startswith("Local answer failed validation:")
+
+
+def test_explicit_equation_is_required_and_latex_spacing_is_accepted():
+    from gateway.rag_client import answer_validation_error
+    query = "Explain q = ne in under 30 words."
+    assert answer_validation_error(query, "Charge is discrete.") is not None
+    assert answer_validation_error(query, r"The equation is q = n\,e, where n is an integer.") is None

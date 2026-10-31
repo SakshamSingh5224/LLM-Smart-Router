@@ -112,11 +112,18 @@ def test_policy_enforcement_workflow(mock_get_decision, mock_collect_stream, cli
     assert data3["decision"]["tier"] == "low"
     assert "Monthly quota exhausted" in data3["decision"]["reasoning"]
 
-    # 7. Verify usage ledger records all 3 requests
+    # An explicit HIGH request and cache preference must not bypass exhausted policy.
+    forced = client.post("/api/chat", json={"query": "another question", "force_tier": "high", "use_cache": True}, headers=headers)
+    assert forced.status_code == 200
+    assert forced.json()["decision"]["tier"] == "low"
+    assert forced.json()["downgraded"] is True
+
+    # 7. Verify usage ledger records all requests
     db = TestingSessionLocal()
     try:
         ledger_entries = db.query(UsageLedger).all()
-        assert len(ledger_entries) == 3
+        assert len(ledger_entries) == 4
         assert ledger_entries[2].was_downgraded is True
     finally:
         db.close()
+
