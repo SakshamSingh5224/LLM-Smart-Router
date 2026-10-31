@@ -50,11 +50,12 @@
                 try {
                     data = await res.json();
                 } catch (e) {
-                    data = { detail: "Invalid server response format." };
+                    data = { detail: `Gateway returned HTTP ${res.status} without valid JSON. Check backend availability.` };
                 }
                 
                 if (res.ok) {
                     if (endpoint.includes('login')) {
+                        if (!data.access_token) throw new Error(data.detail || 'Login returned no access token.');
                         localStorage.setItem('token', data.access_token);
                         window.location.href = '/chat.html'; 
                     } else {
@@ -68,9 +69,10 @@
             } catch (err) {
                 console.error("Network error details:", err);
                 msgLabel.style.color = "var(--error)";
-                msgLabel.innerText = 'Network error. Check connection or CORS.';
+                msgLabel.innerText = err.message || 'Network error. Check connection or CORS.';
             }
         }
     </script>
 </body>
 </html>
+

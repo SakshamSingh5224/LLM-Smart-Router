@@ -118,6 +118,11 @@ def gateway_client(monkeypatch):
         run=lambda q: _result(True)
     )
 
+    from dataclasses import replace
+    old_cfg = gw.cfg
+    gw.cfg = replace(gw.cfg, enable_mvp3_routing=True, enable_mvp3_retrieval=True,
+                     enable_mvp3d_rag=True, semantic_cache_enabled=True)
+    monkeypatch.setattr(gw, "cfg", gw.cfg)
     client = TestClient(gw.app)
 
     try:
@@ -134,6 +139,7 @@ def gateway_client(monkeypatch):
         gw.app.dependency_overrides.clear()
         gw.app.dependency_overrides.update(old_overrides)
 
+        gw.cfg = old_cfg
         db_mod.engine = old_engine
         db_mod.SessionLocal = old_session_local
 
@@ -190,7 +196,7 @@ def test_local_rag_semantic_cache_hit_skips_retrieval(gateway_client):
             )
 
         def get(self, query, mode):
-            raise AssertionError("exact cache should not be consulted on LOCAL-RAG semantic hit")
+            return None
 
     old_cache = gw.cache
     old_retrieval = gw.retrieval_pipeline
@@ -241,7 +247,7 @@ def test_local_rag_stream_semantic_cache_hit_skips_retrieval(gateway_client):
             )
 
         def get(self, query, mode):
-            raise AssertionError("exact cache should not be consulted on LOCAL-RAG semantic hit")
+            return None
 
     old_cache = gw.cache
     old_retrieval = gw.retrieval_pipeline
@@ -340,3 +346,120 @@ def test_phase3f_reranker_exception_falls_back_to_external(gateway_client, monke
     finally:
         gw.retrieval_pipeline = old_retrieval
         gw.get_decision = old_get_decision
+
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_exact_cache_precedes_retrieval_with_semantic_disabled(gateway_client, monkeypatch, stream):
+    from dataclasses import replace
+    from gateway.cache import CacheEntry
+    client, gw, _ = gateway_client
+    monkeypatch.setattr(gw, "cfg", replace(gw.cfg, semantic_cache_enabled=False))
+    decision = {"tier": "LOCAL-RAG", "p_strong": 0.0, "threshold": 0.7,
+                "confidence": 0.9, "mode": "balanced", "source": "local_rag", "reasoning": "cached"}
+    class Exact:
+        def get(self, query, mode):
+            return CacheEntry("cached exact", "LOCAL-RAG", 0, 0, decision=decision)
+        def semantic_get(self, *args):
+            raise AssertionError("semantic lookup must be disabled")
+    monkeypatch.setattr(gw, "cache", Exact())
+    def must_not_retrieve(query):
+        raise AssertionError("cache hit must skip retrieval")
+    monkeypatch.setattr(gw.retrieval_pipeline, "run", must_not_retrieve)
+    response = client.post("/api/chat/stream" if stream else "/api/chat", json={"query": "repeat", "use_cache": True})
+    assert response.status_code == 200
+    if stream:
+        assert '"cache_hit": true' in response.text and "cached exact" in response.text
+    else:
+        assert response.json()["cache_hit"] is True
+        assert response.json()["router_latency_ms"] == 0
+        assert response.json()["answer"] == "cached exact"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_forced_high_reports_actual_backend_and_retains_context(gateway_client, monkeypatch, stream):
+    client, gw, _ = gateway_client
+    seen = []
+    class High:
+        async def stream_chat(self, messages, **kwargs):
+            seen.append(messages)
+            yield StreamChunk(delta="HIGH provider")
+            yield StreamChunk(done=True)
+    monkeypatch.setattr(gw, "high_client", High())
+    response = client.post("/api/chat/stream" if stream else "/api/chat", json={"query": "Chandrayaan-3?", "force_tier": "high", "use_cache": True})
+    assert response.status_code == 200
+    assert seen and "July 14, 2023" in seen[0][1]["content"]
+    if stream:
+        assert '"tier": "high"' in response.text and '"source": "forced_tier"' in response.text
+    else:
+        body = response.json()
+        assert body["decision"]["tier"] == "high"
+        assert body["decision"]["source"] == "forced_tier"
+        assert body["cache_hit"] is False
+        assert body["sources"][0]["source"] == "isro.pdf"
+
+
+def test_non_english_routes_high_with_retrieved_context(gateway_client, monkeypatch):
+    client, gw, _ = gateway_client
+    class High:
+        async def stream_chat(self, messages, **kwargs):
+            assert "July 14, 2023" in messages[1]["content"]
+            yield StreamChunk(delta="यह चंद्र मिशन है।")
+            yield StreamChunk(done=True)
+    monkeypatch.setattr(gw, "high_client", High())
+    response = client.post("/api/chat", json={"query": "Chandrayaan-3? Answer in Hindi.", "use_cache": False})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["decision"]["tier"] == "high"
+    assert body["decision"]["source"] == "language_fallback"
+    assert body["sources"]
+
+
+def test_database_outage_returns_json_503(gateway_client):
+    from sqlalchemy.exc import OperationalError
+    client, gw, _ = gateway_client
+    original = gw.app.dependency_overrides[gw.get_db]
+    def unavailable():
+        raise OperationalError("test", {}, Exception("private database connection details"))
+    gw.app.dependency_overrides[gw.get_db] = unavailable
+    try:
+        response = client.post("/api/chat", json={"query": "hello"})
+        assert response.status_code == 503
+        assert response.headers["content-type"].startswith("application/json")
+        assert "private database" not in response.text
+    finally:
+        gw.app.dependency_overrides[gw.get_db] = original
+
+
+@pytest.mark.parametrize("subject,expired", [("not-an-id", False), ("1", True), (None, False)])
+def test_invalid_or_expired_signed_jwt_rejected(gateway_client, subject, expired):
+    from datetime import datetime, timedelta, timezone
+    from jose import jwt
+    import gateway.auth as auth
+    client, gw, _ = gateway_client
+    override = gw.app.dependency_overrides.pop(gw.get_current_user)
+    payload = {"sub": subject, "exp": datetime.now(timezone.utc) + timedelta(minutes=-1 if expired else 5)}
+    token = jwt.encode(payload, auth.SECRET_KEY, algorithm=auth.ALGORITHM)
+    try:
+        response = client.post("/api/chat", json={"query": "hello"}, headers={"Authorization": "Bearer " + token})
+        assert response.status_code == 401
+    finally:
+        gw.app.dependency_overrides[gw.get_current_user] = override
+
+
+def test_ollama_generation_failure_falls_back(gateway_client, monkeypatch):
+    from gateway.tier_clients import StreamStats
+    client, gw, _ = gateway_client
+    class BrokenRag:
+        async def generate(self, *args, **kwargs):
+            return StreamStats(error="Ollama unavailable")
+    monkeypatch.setattr(gw, "local_rag_client", BrokenRag())
+    response = client.post("/api/chat", json={"query": "Chandrayaan-3?", "use_cache": False})
+    assert response.status_code == 200
+    assert "generation failed" in response.json()["decision"]["reasoning"]
+    assert response.json()["decision"]["tier"] in ("low", "high")
+
+
+def test_non_admin_cannot_read_admin_users(gateway_client):
+    client, _, _ = gateway_client
+    assert client.get("/api/admin/users").status_code == 403

@@ -123,7 +123,7 @@ document.addEventListener("DOMContentLoaded", () => {
                     query: text,
                     mode: currentMode,
                     explain: wantsExplanation,
-                    use_cache: true
+                    use_cache: document.getElementById("useCache")?.checked ?? true
                 })
             });
 
@@ -135,8 +135,9 @@ document.addEventListener("DOMContentLoaded", () => {
             }
 
             if (!response.ok) {
-                const errData = await response.json();
-                throw new Error(errData.detail || 'Server error occurred');
+                let errData = {};
+                try { errData = await response.json(); } catch (_) { /* proxy may return plain text */ }
+                throw new Error(errData.detail || `Gateway returned HTTP ${response.status}. Check backend availability.`);
             }
 
             const data = await response.json();
@@ -426,3 +427,4 @@ document.addEventListener("DOMContentLoaded", () => {
         if (res.ok) adminBtn.style.display = '';
     }).catch(() => {});
 });
+

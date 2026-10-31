@@ -69,6 +69,8 @@ class LocalRetriever:
         self.client = QdrantClient(
             url=self.cfg.qdrant_url,
             api_key=self.cfg.qdrant_api_key or None,
+            check_compatibility=False,
+            timeout=5,
         )
         self._embedding_model: TextEmbedding | None = None
         self._embedding_model_lock = Lock()
@@ -134,3 +136,4 @@ class LocalRetriever:
 
     def search(self, query: str) -> str:
         return self.retrieve(query).context
+

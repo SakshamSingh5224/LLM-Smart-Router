@@ -108,7 +108,7 @@ def test_semantic_cache_stores_non_local_rag_responses():
         "signals": [],
     }
     cache.put(
-        "Explain semantic caching in two sentences.",
+        "Explain semantic caching.",
         "balanced",
         "Semantic caching reuses answers for similar questions.",
         "LOW",
@@ -221,3 +221,73 @@ def test_semantic_cache_preserves_source_metadata():
     hit = cache.semantic_get("What is Chandrayaan-3?", "balanced")
     assert hit is not None
     assert hit.sources == sources
+
+
+
+def test_language_instruction_does_not_reuse_english_answer():
+    cache = make_cache()
+    query = "What is Chandrayaan-3?"
+    cache.put(query, "balanced", "A lunar mission.", "high", 0.0, {"tier": "high"})
+    assert cache.semantic_get(query + " Answer in Hindi.", "balanced") is None
+
+
+def test_same_language_paraphrase_can_reuse_answer():
+    cache = make_cache()
+    cache.put("What is Chandrayaan-3? Answer in Hindi.", "balanced", "यह एक चंद्र मिशन है।", "high", 0.0, {"tier": "high"})
+    assert cache.semantic_get("Explain Chandrayaan-3. Answer in Hindi.", "balanced") is not None
+    assert cache.semantic_get("Explain Chandrayaan-3. Answer in English.", "balanced") is None
+
+
+def test_format_numbers_and_negation_do_not_cross_match():
+    cache = make_cache()
+    cache.put("What is Chandrayaan-3?", "balanced", "A mission.", "high", 0.0, {"tier": "high"})
+    for query in ["What is Chandrayaan-3? Return JSON.", "What is Chandrayaan-2?", "What is not Chandrayaan-3?"]:
+        assert cache.semantic_get(query, "balanced") is None
+
+
+def test_word_limits_do_not_cross_match():
+    cache = make_cache()
+    cache.put("Explain Chandrayaan-3 in under 50 words.", "balanced", "A lunar mission.", "high", 0.0, {"tier": "high"})
+    assert cache.semantic_get("Explain Chandrayaan-3 in under 10 words.", "balanced") is None
+
+
+def test_known_instruction_violations_are_not_cached():
+    cache = make_cache()
+    query = "What is Chandrayaan-3? Answer in Hindi."
+    cache.put(query, "balanced", "An English answer.", "high", 0.0, {"tier": "high"})
+    assert cache.get(query, "balanced") is None
+    assert not cache._redis.data
+    query = "Explain Chandrayaan-3 in under 3 words."
+    cache.put(query, "balanced", "This is far too long.", "high", 0.0, {"tier": "high"})
+    assert cache.get(query, "balanced") is None
+
+
+def test_legacy_entries_without_constraint_metadata_are_rejected():
+    import json
+    cache = make_cache()
+    cache.put("What is Chandrayaan-3?", "balanced", "A mission.", "high", 0.0, {"tier": "high"})
+    key = next(iter(cache._redis.data))
+    payload = json.loads(cache._redis.data[key])
+    payload.pop("constraints")
+    cache._redis.data[key] = json.dumps(payload)
+    assert cache.semantic_get("What is Chandrayaan-3?", "balanced") is None
+
+
+def test_same_word_limit_survives_json_serialization():
+    cache = make_cache()
+    cache.put("Explain Chandrayaan-3 in under 50 words.", "balanced", "A lunar mission.", "high", 0.0, {"tier": "high"})
+    assert cache.semantic_get("Describe Chandrayaan-3 in under 50 words.", "balanced") is not None
+
+
+def test_normal_instructions_are_not_misread_as_languages():
+    from gateway.cache import request_constraints
+    assert request_constraints("Write a Python function to remove duplicates.")["languages"] == []
+    assert request_constraints("Explain semantic caching in two sentences.")["languages"] == []
+    assert request_constraints("Answer in JSON.")["languages"] == []
+
+
+def test_mostly_english_answer_with_one_hindi_word_is_not_cached():
+    cache = make_cache()
+    q = "What is Chandrayaan-3? Answer in Hindi."
+    cache.put(q, "balanced", "नमस्ते. This is otherwise a long English answer that ignores the language instruction.", "high", 0.0, {"tier": "high"})
+    assert cache.get(q, "balanced") is None

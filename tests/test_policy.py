@@ -52,3 +52,13 @@ def test_policy_engine_evaluates_thresholds(test_db):
     # 5. Test Strict User - Over Threshold -> Block
     decision = engine.evaluate(user_strict.id)
     assert decision.action == "block"
+
+
+
+def test_rate_limiter_rejects_burst_without_waiting():
+    from gateway.security import TokenBucket
+    bucket = TokenBucket(rate_per_min=1, burst=2)
+    assert bucket.allow("same-client")
+    assert bucket.allow("same-client")
+    assert not bucket.allow("same-client")
+    assert bucket.allow("different-client")

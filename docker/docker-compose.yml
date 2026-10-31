@@ -49,6 +49,9 @@ services:
       # Persist Hugging Face/FastEmbed downloads across gateway rebuilds; avoids
       # repeating the multi-minute cold model download after container recreation.
       - model_cache:/root/.cache
+      # Read-only development source mounts preserve fixes across recreation.
+      - ../gateway:/app/gateway:ro
+      - ../frontend:/app/frontend:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
@@ -130,3 +133,4 @@ volumes:
   qdrant_storage:
   redis_storage:
   model_cache:
+

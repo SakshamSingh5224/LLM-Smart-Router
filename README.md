@@ -632,3 +632,73 @@ Planned work:
 4. Test authentication, authorization, rate limits, invalid requests, timeouts, and error handling.
 5. Benchmark uncached latency, cache hit rate, and estimated cost savings.
 6. Document reproducible evaluation results and known limitations before declaring the MVP release-ready.
+
+
+
+## Phase 3G batch validation (release gate remains open)
+
+The reviewed batch fixes exact-cache ordering, forced-tier provenance, explicit
+language/format/quantity compatibility for semantic hits, and JSON database
+errors. The semantic-cache namespace is versioned so old entries cannot bypass
+the new guards. These guards are conservative heuristics, not a proof that two
+questions are equivalent or that generated answers are true. Explicit non-English
+output requests use the existing HIGH tier unless an explicit override or budget
+policy requires otherwise; multilingual local generation is not validated.
+
+The local compose configuration mounts the existing `gateway/` and `frontend/`
+directories read-only. Code changes then need a gateway restart/recreation, not a
+new image build. Model-download volumes remain in place. The image must still be
+rebuilt when dependencies change or when packaging a deployment without mounts.
+
+Reviewed PDF corrections are keyed by SHA-256 and page in the existing ingestion
+script: Chandrayaan-3 page 7 preserves payload categories, and NCERT page 6
+preserves microcoulomb and exponent notation. A changed PDF never silently inherits
+these transcriptions. The existing reviewed Qdrant records were corrected in the
+working environment; ingestion preserves the corrections on subsequent runs.
+This is a scoped curation fix, not a general layout-aware PDF extraction engine.
+The third PDF is excluded from this validation scope at the user's request.
+
+Run the existing script once for the bulk live suite:
+
+```bash
+python scripts/verify_phase3f.py --phase3g --login --base-url http://127.0.0.1:8000
+```
+
+Use an existing account. The password is hidden and credentials/tokens are never
+printed or written by the script. Run with the local base URL for server timing;
+repeat against the Vercel origin only when checking the public proxy. The suite
+prints answers and separate PASS/FAIL results for auth rejection, request
+validation, PDF provenance and grouping, exact and semantic reuse, language
+isolation, NCERT local/HIGH answers, insufficient-context fallback, SSE, and the
+configured cache latency budget (default 2000 ms). It does not stop dependencies,
+change quotas, create accounts, or test the third PDF. Offline tests inject Redis,
+retrieval and generation failures and exercise policy exhaustion. Unauthenticated
+or skipped coverage is never treated as a full Phase 3G pass.
+
+Live answers still require human faithfulness review: the automated semantic
+checks are deliberately narrow. Generation TTFT is not end-to-end first-token
+latency; retrieval, authentication and accounting add time. Paid-cost estimates
+remain zero with the current free-tier cost configuration, so no percentage
+financial savings are claimed. Local 1.5B generation previously showed factual,
+word-limit and Hindi failures and high latency. These are recorded limitations,
+not resolved merely by a passing HTTP status or retrieval score. Phase 3G is not
+release-ready until live accuracy and agreed performance targets pass.
+
+The install mode accepts only an immutable commit SHA. It downloads and validates
+updates to existing files, records tracked local edits in Git stash without
+resetting the working tree, runs offline regressions, and starts only the gateway
+with `--no-build`. It leaves provider keys, JWT secrets, PDFs, Qdrant data and the
+Vercel tunnel configuration intact. Optional semantic re-enablement changes only
+`SEMANTIC_CACHE_ENABLED` in the existing `.env` after offline checks succeed.
+Updates remain uncommitted locally for review; merge/publish the reviewed PR to
+make the frontend cache checkbox available on Vercel.
+
+
+Batch validation evidence (2026-10-31): 94 offline tests passed on Python 3.12,
+including cache instruction collisions, exact-hit retrieval bypass, forced tier
+provenance for JSON/SSE, retained context, malformed/expired JWT rejection,
+non-admin authorization, rate-limit bursts, policy exhaustion, Redis/retrieval/
+generation failure paths, database JSON 503 handling, and installer validation.
+Python parsing, frontend JavaScript syntax and diff whitespace checks also passed.
+Live hardware/model/API checks remain pending; offline mocks do not establish
+answer accuracy, availability, throughput, or latency on the target laptop.
