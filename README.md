@@ -616,9 +616,102 @@ The frontend is deployed on Vercel. During the current free-tier integration set
 Important operational notes:
 
 - The local Docker services and Cloudflare Tunnel must be running for this integration to work.
-- A Quick Tunnel URL is temporary and may change. Update `frontend/config.js` and the relevant rewrite destination in `vercel.json` if it changes.
+- Each new Quick Tunnel gets a temporary URL. Update both rewrite destinations in `vercel.json` when the URL changes. Keep `frontend/config.js` set to `window.API_BASE = "";` so the frontend uses the Vercel proxy.
 - This setup is suitable for development and demonstration; it is not a permanently hosted backend.
 - Never commit `.env` files, API keys, access tokens, passwords, or other secrets to the repository.
+
+#### Stop and restart Cloudflare on Ubuntu
+
+The existing Docker setup does not require virtual-environment activation or an
+image rebuild for normal startup. Run these commands on your Ubuntu laptop.
+
+1. **Start the existing backend services** in your project terminal:
+
+   ```bash
+   cd ~/Desktop/llm-smart-router
+   docker compose --env-file .env -f docker/docker-compose.yml up -d --no-build
+   ```
+
+   Ollama must also be running on the host. Check it and the gateway:
+
+   ```bash
+   curl --max-time 10 -sS http://localhost:11434/api/tags
+   curl --max-time 10 -sS http://localhost:8000/health
+   ```
+
+   Wait until gateway health returns `{"status":"ok"}`. If Ollama is installed
+   as a system service but is stopped, start it with `sudo systemctl start ollama`.
+   Do not continue if either service is unavailable.
+
+2. **Stop the existing tunnel:** select the terminal running `cloudflared` and
+   press **Ctrl+C**. You can then close that terminal window. This stops public
+   tunnel access; it does not stop the Docker services.
+
+3. **Restart the tunnel** in a new terminal:
+
+   ```bash
+   cloudflared tunnel --url http://localhost:8000
+   ```
+
+   Keep this terminal open and copy the newly printed HTTPS URL ending in
+   `trycloudflare.com`. Restarting creates a new URL. If your existing tunnel is
+   still running, you can keep using it without restarting or changing Vercel.
+
+4. **Check the new tunnel** from your project terminal, replacing the placeholder:
+
+   ```bash
+   curl --max-time 20 -sS https://YOUR-NEW-TUNNEL.trycloudflare.com/health
+   ```
+
+   Continue when it returns `{"status":"ok"}`.
+
+5. **Update only the backend destinations** in the existing `vercel.json`.
+   Replace the old tunnel hostname in both rewrites, preserving the paths:
+
+   ```json
+   {
+     "source": "/api/:path*",
+     "destination": "https://YOUR-NEW-TUNNEL.trycloudflare.com/api/:path*"
+   },
+   {
+     "source": "/health",
+     "destination": "https://YOUR-NEW-TUNNEL.trycloudflare.com/health"
+   }
+   ```
+
+   These are entries inside the existing `rewrites` array, not a replacement
+   for the entire file. Keep the frontend configuration as:
+
+   ```javascript
+   window.API_BASE = "";
+   ```
+
+6. **Publish the URL update** from your project terminal on `main`:
+
+   ```bash
+   git diff -- vercel.json
+   git add vercel.json
+   git commit -m "Update Cloudflare Quick Tunnel URL"
+   git push origin main
+   ```
+
+   Wait for the connected Vercel deployment to finish. Commit and redeploy only
+   when the tunnel URL changes.
+
+7. **Verify Vercel**, then open the chat:
+
+   - Health: https://llm-smart-router-steel.vercel.app/health
+   - Website: https://llm-smart-router-steel.vercel.app/
+
+   The health response should be `{"status":"ok"}`. Hard-refresh the website
+   with **Ctrl+Shift+R** if needed, then log in.
+
+During the demo, keep the laptop awake and connected to the internet, the backend
+services and Ollama running, and the Cloudflare terminal open. Stopping the
+tunnel makes the Vercel API unavailable until a working tunnel is configured.
+Quick Tunnels are temporary demonstration access and do not support public SSE
+streaming; the local SSE test does not establish streaming through this tunnel.
+See [Cloudflare Quick Tunnel limitations](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/#limitations).
 
 ### Phase 3G — Evaluation and Hardening (Next)
 
