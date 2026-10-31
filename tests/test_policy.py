@@ -62,3 +62,43 @@ def test_rate_limiter_rejects_burst_without_waiting():
     assert bucket.allow("same-client")
     assert not bucket.allow("same-client")
     assert bucket.allow("different-client")
+
+
+def test_policy_and_usage_evaluated_in_one_select(test_db):
+    from sqlalchemy import event
+    policy = Policy(name="one-query", query_threshold=5, tier_scope="high")
+    user = User(email="one-query@test.com", password_hash="hash")
+    test_db.add_all([policy, user]); test_db.commit()
+    test_db.add(UserPolicy(user_id=user.id, policy_id=policy.id)); test_db.commit()
+    uid = user.id
+    selects = []
+    def record(conn, cursor, statement, params, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            selects.append(statement)
+    engine = test_db.get_bind()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        assert PolicyEngine(test_db).evaluate(uid).action == "allow"
+        assert len(selects) == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+
+def test_high_only_policy_counts_only_high_usage(test_db):
+    policy = Policy(name="high-only", query_threshold=1, tier_scope="high")
+    user = User(email="high-only@test.com", password_hash="hash")
+    test_db.add_all([policy, user]); test_db.commit()
+    test_db.add(UserPolicy(user_id=user.id, policy_id=policy.id)); test_db.commit()
+    engine = PolicyEngine(test_db)
+    engine.record_usage(user.id, LOW, 10, 0, False)
+    assert engine.evaluate(user.id).action == "allow"
+    engine.record_usage(user.id, HIGH, 10, 0, False)
+    assert engine.evaluate(user.id).is_downgraded
+
+
+def test_zero_quota_blocks_without_first_allowing_a_request(test_db):
+    policy = Policy(name="zero-quota", query_threshold=0, action_on_exhaustion="block")
+    user = User(email="zero-quota@test.com", password_hash="hash")
+    test_db.add_all([policy, user]); test_db.commit()
+    test_db.add(UserPolicy(user_id=user.id, policy_id=policy.id)); test_db.commit()
+    assert PolicyEngine(test_db).evaluate(user.id).action == "block"

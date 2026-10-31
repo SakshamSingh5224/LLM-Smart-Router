@@ -463,3 +463,69 @@ def test_ollama_generation_failure_falls_back(gateway_client, monkeypatch):
 def test_non_admin_cannot_read_admin_users(gateway_client):
     client, _, _ = gateway_client
     assert client.get("/api/admin/users").status_code == 403
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_quality_failure_uses_high_and_retains_context(gateway_client, monkeypatch, stream):
+    from gateway.rag_client import LocalRagClient
+    client, gw, _ = gateway_client
+    class BadLocal:
+        async def stream_chat(self, messages, **kwargs):
+            yield StreamChunk(delta="one two three four five")
+            yield StreamChunk(done=True)
+    class GoodHigh:
+        async def stream_chat(self, messages, **kwargs):
+            assert "July 14, 2023" in messages[1]["content"]
+            yield StreamChunk(delta="correct high answer")
+            yield StreamChunk(done=True)
+    monkeypatch.setattr(gw, "local_rag_client", LocalRagClient(BadLocal()))
+    monkeypatch.setattr(gw, "high_client", GoodHigh())
+    response = client.post("/api/chat/stream" if stream else "/api/chat", json={"query": "Chandrayaan-3? Answer in under 3 words.", "use_cache": False})
+    assert response.status_code == 200
+    if stream:
+        assert "event: fallback" in response.text
+        assert "correct high answer" in response.text
+        assert '"source": "quality_fallback"' in response.text
+    else:
+        body = response.json()
+        assert body["answer"] == "correct high answer"
+        assert body["decision"]["tier"] == "high"
+        assert body["decision"]["source"] == "quality_fallback"
+        assert body["sources"]
+
+
+def test_downgrade_cannot_reuse_cached_high_answer(gateway_client, monkeypatch):
+    from gateway.cache import ResponseCache
+    from gateway.policy import PolicyDecision
+    client, gw, _ = gateway_client
+    cache = ResponseCache(semantic_enabled=False)
+    query = "Chandrayaan-3?"
+    decision = {"tier": "high", "p_strong": 0.9, "threshold": 0.7, "confidence": 0.8,
+                "mode": "balanced", "source": "classifier", "reasoning": "old high answer"}
+    cache.put(query, "balanced", "restricted cached answer", "high", 0.9, decision)
+    monkeypatch.setattr(gw, "cache", cache)
+    monkeypatch.setattr(gw.PolicyEngine, "evaluate", lambda self, uid: PolicyDecision(action="downgrade_to_low", reason="quota", is_downgraded=True))
+    response = client.post("/api/chat", json={"query": query, "use_cache": True})
+    assert response.status_code == 200
+    assert response.json()["decision"]["tier"] == "low"
+    assert response.json()["cache_hit"] is False
+    assert response.json()["answer"] != "restricted cached answer"
+
+
+def test_cache_hits_still_count_toward_quota(gateway_client):
+    from gateway.db.models import Policy, UserPolicy, UsageLedger
+    client, gw, _ = gateway_client
+    uid = gw.app.dependency_overrides[gw.get_current_user]().id
+    with gw.db_module.SessionLocal() as db:
+        policy = Policy(name="cached-query-quota", query_threshold=2, action_on_exhaustion="block")
+        db.add(policy); db.flush()
+        db.add(UserPolicy(user_id=uid, policy_id=policy.id)); db.commit()
+    payload = {"query": "Chandrayaan-3 quota-cache-test", "use_cache": True}
+    first = client.post("/api/chat", json=payload)
+    second = client.post("/api/chat", json=payload)
+    third = client.post("/api/chat", json=payload)
+    assert first.status_code == second.status_code == 200
+    assert second.json()["cache_hit"] is True
+    assert third.status_code == 402
+    with gw.db_module.SessionLocal() as db:
+        assert db.query(UsageLedger).filter(UsageLedger.user_id == uid).count() == 2

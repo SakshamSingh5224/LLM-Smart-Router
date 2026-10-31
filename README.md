@@ -702,3 +702,40 @@ generation failure paths, database JSON 503 handling, and installer validation.
 Python parsing, frontend JavaScript syntax and diff whitespace checks also passed.
 Live hardware/model/API checks remain pending; offline mocks do not establish
 answer accuracy, availability, throughput, or latency on the target laptop.
+
+
+### Follow-up to the first live Phase 3G batch
+
+The initial live suite passed 15/17 checks. Exact and semantic reuse, language
+isolation, auth/request rejection, source-backed payload grouping, external
+fallback, forced HIGH provenance, SSE and accounting passed. Cache latency
+(3175.6 ms against a 2000 ms budget) and the NCERT local answer failed. Those
+failures are retained as evidence, not reclassified as successes.
+
+The follow-up combines policy and monthly-usage evaluation into one SQL query.
+Early cache hits insert their usage row and commit in the same short request
+transaction; misses release the read transaction before model work. Validated
+user ids are captured before commits to avoid extra ORM-refresh queries. Quota
+checks remain fresh on every request, accounting stays synchronous/durable before
+successful cache responses (subject to the existing best-effort DB-failure
+behavior), and cache hits cannot bypass a downgrade. JSON cache responses expose
+policy, lookup and accounting times; the runner also prints client wall time.
+The 2000 ms target is unchanged and must be measured again on Neon.
+
+Local output is checked for explicit language/format/word-limit violations and
+omission of an equation explicitly supplied in the question. Failure uses HIGH
+with the same retrieved context, `source=quality_fallback`, and retained sources.
+This is output-contract validation, not a general factuality verifier. Passing a
+quality-fallback test validates the hybrid path, not the raw 1.5B local model.
+The semantic namespace is bumped again to exclude older responses. SSE clients
+must honor the existing fallback event and discard provisional local text when
+it occurs. CPU-generation latency and broader local-answer correctness remain
+known limitations; no new model or dependency installation is required.
+
+
+Follow-up validation evidence: 103 offline tests passed on Python 3.12, including
+single-query policy evaluation, high-only and zero-quota behavior, cached-request
+quota accounting, downgrade/cache isolation, and explicit output-validation
+fallback for JSON and SSE. The installer force-recreates only the gateway so
+already-mounted Python source is reloaded on repeat updates; it never rebuilds
+the image. The optimized remote-database latency is not claimed until remeasured.

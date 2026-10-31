@@ -23,7 +23,7 @@ from prometheus_client import Counter
 log = logging.getLogger("gateway.cache")
 
 _WS_RE = re.compile(r"\s+")
-SEMANTIC_KEY_PREFIX = "llm-router:semantic-cache:v2:"
+SEMANTIC_KEY_PREFIX = "llm-router:semantic-cache:v3:"
 SEMANTIC_CACHE_HIT_COUNTER = Counter(
     "semantic_cache_hits_total",
     "Semantic cache hits",

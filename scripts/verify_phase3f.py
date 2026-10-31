@@ -42,7 +42,7 @@ def post_json(base_url: str, path: str, payload: dict, token: str, timeout: int 
 # Phase 3G extends this existing script; it does not create project files.
 INSTALL_FILES = (
     "gateway/app.py", "gateway/cache.py", "gateway/auth.py", "gateway/db/database.py",
-    "gateway/rag_client.py", "gateway/retriever.py", "scripts/ingest_docs.py",
+    "gateway/rag_client.py", "gateway/retriever.py", "gateway/policy.py", "scripts/ingest_docs.py",
     "scripts/verify_phase3f.py", "frontend/app.js", "frontend/chat.html",
     "frontend/index.html", "docker/docker-compose.yml", "tests/test_mvp3e_cache.py",
     "tests/test_mvp3d_gateway.py", "tests/test_gateway.py", "tests/test_mvp3d_rag.py",
@@ -99,7 +99,7 @@ def install_batch(revision: str, enable_semantic: bool) -> int:
             text = text.rstrip() + "\nSEMANTIC_CACHE_ENABLED=true\n"
         env_path.write_text(text)
     compose = ["docker", "compose", "--env-file", ".env", "-f", "docker/docker-compose.yml"]
-    subprocess.run(compose + ["up", "-d", "--no-build", "--no-deps", "gateway"], check=True)
+    subprocess.run(compose + ["up", "-d", "--no-build", "--no-deps", "--force-recreate", "gateway"], check=True)
     import time
     for _ in range(90):
         try:
@@ -120,9 +120,12 @@ def phase3g_checks(base_url, token, check, latency_budget_ms):
     session = {}
     question = "According to the Chandrayaan-3 PDF, list payload names only, grouped under Lander, Rover and Propulsion Module. Answer in English."
     def call(query, **options):
+        import time
+        started = time.perf_counter()
         status, data = post_json(base_url, "/api/chat", {"query": query, "mode": "balanced", **options}, token)
+        data["client_wall_ms"] = round((time.perf_counter() - started) * 1000, 1)
         assert status == 200, f"HTTP {status}"
-        print("      " + json.dumps({k: data.get(k) for k in ("answer", "decision", "cache_hit", "total_latency_ms", "sources")}, ensure_ascii=False), flush=True)
+        print("      " + json.dumps({k: data.get(k) for k in ("answer", "decision", "cache_hit", "total_latency_ms", "client_wall_ms", "policy_latency_ms", "cache_lookup_latency_ms", "accounting_latency_ms", "sources")}, ensure_ascii=False), flush=True)
         return data
     def expect_http(payload, expected, bearer=token):
         try:
@@ -189,9 +192,12 @@ def phase3g_checks(base_url, token, check, latency_budget_ms):
         if force:
             assert data["decision"]["tier"] == force and data["decision"]["source"] == "forced_tier"
         else:
-            assert data["decision"]["tier"] == "LOCAL-RAG"
+            decision = data["decision"]
+            assert decision["tier"] == "LOCAL-RAG" or (decision["tier"] == "high" and decision["source"] == "quality_fallback"), "unexpected route"
+            if decision["source"] == "quality_fallback":
+                return "local output rejected; HIGH answered using retrieved context (local model is not validated)"
         return "narrow math/length checks passed; printed answer still needs human faithfulness review"
-    check("NCERT local answer", lambda: ncert_check(None))
+    check("NCERT answer or explicit quality fallback", lambda: ncert_check(None))
     check("forced HIGH provenance and NCERT answer", lambda: ncert_check("high"))
     def insufficient():
         data = call("According to the Chandrayaan-3 PDF, give its final audited expenditure by supplier invoice number. Answer in English.", use_cache=False)

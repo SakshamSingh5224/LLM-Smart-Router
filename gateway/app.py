@@ -134,6 +134,9 @@ class ChatResponse(BaseModel):
     ttft_ms: Optional[float] = None
     estimated_cost_avoided_usd: float = 0.0
     sources: list[dict] = Field(default_factory=list)
+    policy_latency_ms: Optional[float] = None
+    cache_lookup_latency_ms: Optional[float] = None
+    accounting_latency_ms: Optional[float] = None
 
 class UserCreate(BaseModel):
     email: str
@@ -487,20 +490,18 @@ async def system_status():
 @app.post("/api/chat", response_model=ChatResponse, dependencies=[Depends(api_guard)])
 async def chat(req: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     t0 = time.perf_counter()
+    user_id = current_user.id
     request_id = now_id()
     mode = req.mode or cfg.router_mode
 
     # 1. Policy Evaluation
     policy_engine = PolicyEngine(db)
-    policy_decision = policy_engine.evaluate(current_user.id)
+    policy_decision = policy_engine.evaluate(user_id)
+    policy_ms = (time.perf_counter() - t0) * 1000
     POLICY_DECISION_COUNTER.labels(action=policy_decision.action).inc()
     
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
-
-    # End the read transaction before slow model inference. Neon may terminate
-    # sessions left idle in a transaction while local retrieval/model calls run.
-    db.commit()
 
     # 2. Phase 3E: semantic cache is checked before the 3B intent judge.
     # Policy evaluation remains authoritative. A semantic hit contains the
@@ -522,6 +523,7 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
         and not policy_decision.is_downgraded
     )
 
+    cache_t0 = time.perf_counter()
     if local_cache_allowed:
         semantic_hit = cache.get(req.query, mode)
         hit_kind = "exact"
@@ -540,7 +542,10 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
                     ESTIMATED_COST_AVOIDED.inc(avoided)
             else:
                 avoided = 0.0
-            _record_usage_safely(current_user.id, decision.get("tier", LOCAL_RAG), 0, 0.0, False)
+            cache_ms = (time.perf_counter() - cache_t0) * 1000
+            accounting_t0 = time.perf_counter()
+            policy_engine.record_usage(user_id, decision.get("tier", LOCAL_RAG), 0, 0.0, False)
+            accounting_ms = (time.perf_counter() - accounting_t0) * 1000
             router_ms = 0.0
             total = _log_and_finish(
                 request_id, req.query, decision, True, router_ms, 0.0,
@@ -553,6 +558,9 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
                     k: decision[k] for k in RouteDecisionOut.model_fields
                 }),
                 cache_hit=True,
+                policy_latency_ms=round(policy_ms, 1),
+                cache_lookup_latency_ms=round(cache_ms, 1),
+                accounting_latency_ms=round(accounting_ms, 1),
                 router_latency_ms=0.0,
                 generation_latency_ms=0.0,
                 total_latency_ms=round(total, 1),
@@ -563,6 +571,9 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
                 estimated_cost_avoided_usd=avoided if decision.get("tier") == LOCAL_RAG else 0.0,
                 sources=getattr(semantic_hit, "sources", []) or [],
             )
+
+    # Cache misses release the read transaction before slow model work.
+    db.commit()
 
     # Cache miss: preserve the existing 3B -> 3C -> 3D path.
     if cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
@@ -605,7 +616,6 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
         decision = _local_rag_decision(mode, local_rag_result)
         router_ms = intent_decision.latency_ms + local_rag_result.latency_ms
         tier = LOCAL_RAG
-        ROUTED_TO_LOCAL.inc()
     elif (intent_decision is not None and intent_decision.route == "LOCAL_KB"
           and local_rag_result is None and not policy_decision.is_downgraded):
         decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
@@ -637,15 +647,17 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
                 "reasoning": f"Forced {tier}; " + (decision.get("reasoning") or "")}
 
     decision, tier = _language_route(req, decision, tier, policy_decision)
+    if tier == LOCAL_RAG:
+        ROUTED_TO_LOCAL.inc()
 
     # 4. Existing exact cache remains in place for non-semantic/external traffic.
-    if cache and req.use_cache and req.force_tier is None and req.threshold is None and tier != LOCAL_RAG:
+    if cache and req.use_cache and req.force_tier is None and req.threshold is None and not policy_decision.is_downgraded and tier != LOCAL_RAG:
         hit = cache.get(req.query, mode)
         if hit:
             CACHE_HIT.labels(cache_type="exact").inc()
             decision_for_hit = hit.decision or decision
             _record_usage_safely(
-                current_user.id, decision_for_hit.get("tier", tier), 0, 0.0,
+                user_id, decision_for_hit.get("tier", tier), 0, 0.0,
                 policy_decision.is_downgraded,
             )
             total = _log_and_finish(
@@ -688,7 +700,13 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
             if req.force_tier in (LOW, HIGH):
                 fallback_decision = {**fallback_decision, "tier": tier, "source": "forced_tier",
                     "reasoning": f"Forced {tier}; " + (fallback_decision.get("reasoning") or "")}
+            quality_failure = (stats.error or "").startswith("Local answer failed validation:")
+            if quality_failure and req.force_tier is None:
+                tier = HIGH
+                fallback_decision = {**fallback_decision, "tier": HIGH, "source": "quality_fallback"}
             decision = _external_decision(fallback_decision, reason="LOCAL-RAG generation failed; used external fallback")
+            if quality_failure:
+                decision = _external_decision(decision, reason=stats.error)
             router_ms += fallback_router_ms
             client = tier_client(tier)
             messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": augmented_query}]
@@ -706,7 +724,7 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
     # request's authentication/policy session never sits idle during model work.
     cost = cost_of(tier, stats.tokens_est)
     _record_usage_safely(
-        current_user.id, tier, stats.tokens_est, cost, policy_decision.is_downgraded
+        user_id, tier, stats.tokens_est, cost, policy_decision.is_downgraded
     )
 
     estimated_avoided = 0.0
@@ -718,7 +736,7 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
         if estimated_avoided > 0:
             ESTIMATED_COST_AVOIDED.inc(estimated_avoided)
 
-    if cache and req.use_cache and req.force_tier is None and req.threshold is None:
+    if cache and req.use_cache and req.force_tier is None and req.threshold is None and not policy_decision.is_downgraded:
         await asyncio.to_thread(cache.put,
             req.query, mode, stats.text, tier, decision["p_strong"], decision=decision,
             sources=local_rag_result.sources if local_rag_result is not None and local_rag_result.sufficient else [],
@@ -739,18 +757,17 @@ async def chat(req: ChatRequest, current_user: User = Depends(get_current_user),
 @app.post("/api/chat/stream", dependencies=[Depends(api_guard)])
 async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     t0 = time.perf_counter()
+    user_id = current_user.id
     request_id = now_id()
     mode = req.mode or cfg.router_mode
 
     # 1. Policy Evaluation
     policy_engine = PolicyEngine(db)
-    policy_decision = policy_engine.evaluate(current_user.id)
+    policy_decision = policy_engine.evaluate(user_id)
+    policy_ms = (time.perf_counter() - t0) * 1000
     POLICY_DECISION_COUNTER.labels(action=policy_decision.action).inc()
     if policy_decision.action == "block":
         raise HTTPException(status_code=402, detail=policy_decision.reason)
-
-    # Do not leave a Neon transaction open during retrieval or model streaming.
-    db.commit()
 
     # 2. Phase 3E: semantic cache is checked before the 3B intent judge.
     # Policy evaluation remains authoritative. A semantic hit skips 3B/3C/3D.
@@ -771,6 +788,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         and not policy_decision.is_downgraded
     )
 
+    cache_t0 = time.perf_counter()
     if local_cache_allowed:
         semantic_hit = cache.get(req.query, mode)
         hit_kind = "exact"
@@ -783,8 +801,14 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
             CACHE_HIT.labels(cache_type=hit_kind).inc()
             if decision.get("tier") == LOCAL_RAG:
                 ROUTED_TO_LOCAL.inc()
-            _record_usage_safely(current_user.id, decision.get("tier", LOCAL_RAG), 0, 0.0, False)
+            cache_ms = (time.perf_counter() - cache_t0) * 1000
+            accounting_t0 = time.perf_counter()
+            policy_engine.record_usage(user_id, decision.get("tier", LOCAL_RAG), 0, 0.0, False)
+            accounting_ms = (time.perf_counter() - accounting_t0) * 1000
             router_ms = 0.0
+
+    # Cache misses release the read transaction before slow model work.
+    db.commit()
 
     # Cache miss: preserve the existing 3B -> 3C -> 3D path.
     if not cache_hit and cfg.enable_mvp3_routing and cfg.enable_mvp3_retrieval:
@@ -828,7 +852,6 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
             decision = _local_rag_decision(mode, local_rag_result)
             router_ms = intent_decision.latency_ms + local_rag_result.latency_ms
             tier = LOCAL_RAG
-            ROUTED_TO_LOCAL.inc()
         elif (intent_decision is not None and intent_decision.route == "LOCAL_KB"
               and local_rag_result is None and not policy_decision.is_downgraded):
             decision, router_ms = await get_decision(req.query, mode, req.threshold, req.explain)
@@ -862,15 +885,17 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                     "reasoning": f"Forced {tier}; " + (decision.get("reasoning") or "")}
 
         decision, tier = _language_route(req, decision, tier, policy_decision)
+        if tier == LOCAL_RAG:
+            ROUTED_TO_LOCAL.inc()
 
         # Existing exact cache is retained for LOW/HIGH traffic.
-        if cache and req.use_cache and req.force_tier is None and req.threshold is None and tier != LOCAL_RAG:
+        if cache and req.use_cache and req.force_tier is None and req.threshold is None and not policy_decision.is_downgraded and tier != LOCAL_RAG:
             hit = cache.get(req.query, mode)
             if hit:
                 CACHE_HIT.labels(cache_type="exact").inc()
                 decision = hit.decision or decision
                 _record_usage_safely(
-                    current_user.id, decision.get("tier", tier), 0, 0.0,
+                    user_id, decision.get("tier", tier), 0, 0.0,
                     policy_decision.is_downgraded,
                 )
                 cache_hit = True
@@ -947,13 +972,21 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                     if req.force_tier in (LOW, HIGH):
                         fallback_decision = {**fallback_decision, "tier": fallback_tier, "source": "forced_tier",
                             "reasoning": f"Forced {fallback_tier}; " + (fallback_decision.get("reasoning") or "")}
+                    quality_failure = (err or "").startswith("Local answer failed validation:")
+                    if quality_failure and req.force_tier is None:
+                        fallback_tier = HIGH
+                        fallback_decision = {**fallback_decision, "tier": HIGH, "source": "quality_fallback"}
                     decision = _external_decision(
                         fallback_decision,
                         reason="LOCAL-RAG unavailable; used external fallback",
                     )
+                    if quality_failure:
+                        decision = _external_decision(decision, reason=err)
                     tier = fallback_tier
                     router_ms += fallback_router_ms
-                    yield sse("fallback", {"from": LOCAL_RAG, "to": tier, "reason": err})
+                    yield sse("fallback", {"from": LOCAL_RAG, "to": tier, "reason": err,
+                                           "decision": decision,
+                                           "sources": local_rag_result.sources if local_rag_result is not None and local_rag_result.sufficient else []})
 
                     text_parts = []
                     ttft_ms = None
@@ -996,7 +1029,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
         estimated_avoided = 0.0
         if not err:
             _record_usage_safely(
-                current_user.id, tier, tokens_est, cost, policy_decision.is_downgraded
+                user_id, tier, tokens_est, cost, policy_decision.is_downgraded
             )
             if tier == LOCAL_RAG:
                 LOCAL_GENERATION_LATENCY.observe(max(0.0, gen_ms))
@@ -1005,7 +1038,7 @@ async def chat_stream(req: ChatRequest, current_user: User = Depends(get_current
                 estimated_avoided = cost_of(LOW, tokens_est)
                 if estimated_avoided > 0:
                     ESTIMATED_COST_AVOIDED.inc(estimated_avoided)
-            if cache and req.use_cache and req.force_tier is None and req.threshold is None:
+            if cache and req.use_cache and req.force_tier is None and req.threshold is None and not policy_decision.is_downgraded:
                 await asyncio.to_thread(cache.put,
                     req.query, mode, full_text, tier, decision["p_strong"], decision=decision,
                     sources=local_rag_result.sources if local_rag_result is not None and local_rag_result.sufficient else [],
