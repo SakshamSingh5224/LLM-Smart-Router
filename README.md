@@ -739,3 +739,39 @@ quota accounting, downgrade/cache isolation, and explicit output-validation
 fallback for JSON and SSE. The installer force-recreates only the gateway so
 already-mounted Python source is reloaded on repeat updates; it never rebuilds
 the image. The optimized remote-database latency is not claimed until remeasured.
+
+
+## Phase 3G scoped automated validation — completed
+
+On 2026-10-31, the user reported the follow-up live suite result:
+
+```text
+Validation result: 17/17 passed; 0 failed
+```
+
+The tested implementation revision was `a8e043b4b7b578632cffe5a58738be22e22aebcf`.
+Its GitHub CI run completed successfully, and 103 offline tests passed during
+implementation. PR #2 was merged into `main` after that result. The initial
+15/17 live result and the fixes it motivated remain documented above.
+
+The final reported summary includes a pass for the unchanged 2000 ms
+server-reported cache budget, guarded semantic reuse, language isolation,
+source-backed document checks, explicit quality fallback, auth/request rejection,
+forced-tier provenance, SSE and usage accounting. Detailed final timing values
+and full final generated answers were not supplied, so no exact cache latency,
+P95, comprehensive accuracy percentage or financial savings are asserted.
+
+Scope and limits:
+
+- The third PDF was excluded at the user's request.
+- A HIGH quality fallback is a successful hybrid path, not proof of raw local
+  model accuracy. Output-contract validation is not a general truth checker.
+- Previously observed local-generation accuracy, word-limit and CPU-latency
+  limitations remain relevant; cache hits and cold generation have different
+  performance characteristics.
+- The free demonstration still depends on the Ubuntu gateway, Ollama, Qdrant,
+  Redis and a running Cloudflare Quick Tunnel. A changed tunnel URL requires
+  updating the existing Vercel rewrite destinations.
+- The production Vercel frontend still needs its final browser smoke check after
+  this merge: login, visible cache checkbox, and a cited PDF answer. The local
+  automated pass does not substitute for that production UI check.
