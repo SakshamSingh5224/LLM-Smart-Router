@@ -3,8 +3,12 @@
   "cleanUrls": true,
   "rewrites": [
     {
-      "source": "/api/:path(.*)",
-      "destination": "https://ryan-surrounded-poker-blah.trycloudflare.com/api/:path"
+      "source": "/api/:path*",
+      "destination": "https://enjoy-station-properties-enhancements.trycloudflare.com/api/:path*"
+    },
+    {
+      "source": "/health",
+      "destination": "https://enjoy-station-properties-enhancements.trycloudflare.com/health"
     }
   ]
 }
